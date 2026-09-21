@@ -4,6 +4,7 @@ import {
   syncTavernHeroStorageFromProfiles,
 } from '../src/chrome/TavernModal';
 import type { TavernHeroProfileDraft } from '../src/pty-client';
+import { composeProjectAgentName, incarnationNameFields } from '../src/chrome/ProjectAgentName';
 
 const PROFILE_STORAGE_KEY = 'kota-v2.tavern.hero-profiles';
 const CUSTOM_HERO_STORAGE_KEY = 'kota-v2.tavern.custom-heroes';
@@ -29,56 +30,72 @@ afterEach(() => {
 });
 
 describe('Tavern CLI-default models', () => {
-  it('omits model flags for fresh Claude, Codex, and Kimi factory heroes', () => {
-    const claude = loadTavernHeroIncarnationProfile('hero-cc');
-    const codex = loadTavernHeroIncarnationProfile('hero-dex');
-    const kimi = loadTavernHeroIncarnationProfile('hero-kimi');
-
-    expect(claude).toMatchObject({ model: 'default', effort: 'max' });
-    expect(claude?.args).toEqual(['--effort', 'max', '--dangerously-skip-permissions']);
-    expect(claude?.shell).toContain('model: default');
-    expect(claude?.shell).not.toContain('claude-opus-4-8[1m]');
-
-    expect(codex).toMatchObject({ model: 'default', effort: 'xhigh' });
-    expect(codex?.args).toEqual([
-      '--config',
-      'model_reasoning_effort="xhigh"',
-      '--dangerously-bypass-approvals-and-sandbox',
-    ]);
-    expect(codex?.shell).toContain('model: default');
-    expect(codex?.shell).not.toContain('gpt-5.5');
-
-    expect(kimi).toMatchObject({ provider: 'kimi', model: 'default' });
-    expect(kimi?.args).toEqual(['--yolo']);
-    expect(kimi?.shell).toContain('model: default');
-    expect(kimi?.shell).not.toContain('--model');
+  it('keeps an invited incarnation name and structured fields through Tavern and a new project', () => {
+    const nameFields = { titleId: 'doctor', given: '颦儿', middle: '绛珠', surname: 'v. Kota' };
+    syncTavernHeroStorageFromProfiles([{
+      ...legacyFactoryProfile('hero-invited-piner', 'codex', 'gpt-5.6-sol'),
+      name: 'Dr. 颦儿-绛珠 v. Kota', nameFields, kind: 'invited',
+      avatarId: 'user:portrait', ghost: 'Personal ghost',
+    }]);
+    const profile = loadTavernHeroIncarnationProfile('hero-invited-piner')!;
+    expect(profile).toMatchObject({ name: 'Dr. 颦儿-绛珠 v. Kota', nameFields,
+      avatarId: 'user:portrait', ghost: 'Personal ghost', model: 'gpt-5.6-sol' });
+    const next = incarnationNameFields(profile.name, profile.nameFields, ' II', 'Other');
+    expect(composeProjectAgentName(next)).toBe('Dr. 颦儿 II-绛珠 v. Other');
+    expect(profile.nameFields).toEqual(nameFields);
+    expect(loadTavernHeroIncarnationProfile('hero-invited-piner')?.name).toBe(profile.name);
   });
 
-  it('rebuilds legacy factory shells while preserving explicitly selected models', () => {
-    syncTavernHeroStorageFromProfiles([
-      legacyFactoryProfile('hero-cc', 'claude', 'claude-opus-4-8[1m]'),
-      legacyFactoryProfile('hero-dex', 'codex', 'gpt-5.5'),
-    ]);
+  it.each([
+    ['hero-cc', 'claude', ['--dangerously-skip-permissions']],
+    ['hero-dex', 'codex', ['--dangerously-bypass-approvals-and-sandbox']],
+    ['hero-gem', 'antigravity', ['--dangerously-skip-permissions']],
+    ['hero-op', 'opencode', ['--pure', '--dangerously-skip-permissions']],
+    ['hero-pi', 'pi', ['--approve']],
+    ['hero-kimi', 'kimi', ['--yolo']],
+  ] as const)('omits model and effort for fresh and saved %s incarnations', (id, provider, args) => {
+    const fresh = loadTavernHeroIncarnationProfile(id)!;
+    expect(fresh).toMatchObject({ provider, model: 'default', effort: undefined });
+    expect(fresh.args).toEqual(args);
+    expect(fresh.shell).toContain('model: default');
+    expect(fresh.shell).not.toMatch(/effort:|--model|--effort|--thinking|model_reasoning_effort/);
 
-    const claude = loadTavernHeroIncarnationProfile('hero-cc');
-    const codex = loadTavernHeroIncarnationProfile('hero-dex');
-    expect(claude?.model).toBe('default');
-    expect(claude?.args).not.toContain('--model');
-    expect(claude?.shell).not.toContain('claude-opus-4-8[1m]');
-    expect(codex?.model).toBe('default');
-    expect(codex?.args).not.toContain('--model');
-    expect(codex?.shell).not.toContain('gpt-5.5');
+    syncTavernHeroStorageFromProfiles([{
+      ...legacyFactoryProfile(id, provider, 'default'), effort: null, shell: fresh.shell,
+    }]);
+    const saved = loadTavernHeroIncarnationProfile(id)!;
+    expect(saved.model).toBe('default');
+    expect(saved.effort).toBeUndefined();
+    expect(saved.args).toEqual(args);
+  });
 
-    window.localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify({
-      'hero-dex': {
-        provider: 'codex',
-        model: 'gpt-5.6-sol',
-        shell: 'model: gpt-5.6-sol\nargs:\n  - "--model"\n  - "gpt-5.6-sol"',
-      },
-    }));
-    const pinned = loadTavernHeroIncarnationProfile('hero-dex');
-    expect(pinned?.model).toBe('gpt-5.6-sol');
-    expect(pinned?.args).toContain('gpt-5.6-sol');
+  it.each([
+    ['hero-cc', 'claude', 'claude-opus-4-8[1m]', 'high', ['--effort', 'high']],
+    ['hero-dex', 'codex', 'gpt-5.5', 'medium', ['--config', 'model_reasoning_effort="medium"']],
+    ['hero-op', 'opencode', 'opencode/custom-model', null, []],
+    ['hero-pi', 'pi', 'zai/glm-5.2', 'low', ['--thinking', 'low']],
+    ['hero-kimi', 'kimi', 'custom-model', null, []],
+  ] as const)('preserves later explicit choices for %s (no read-time reset)', (
+    id, provider, model, effort, effortArgs,
+  ) => {
+    syncTavernHeroStorageFromProfiles([{ ...legacyFactoryProfile(id, provider, model), effort }]);
+    const selected = loadTavernHeroIncarnationProfile(id)!;
+    expect(selected.model).toBe(model);
+    expect(selected.args.slice(0, 2)).toEqual(['--model', model]);
+    expect(selected.args.slice(2, 2 + effortArgs.length)).toEqual(effortArgs);
+    expect(selected.effort ?? null).toBe(effort);
+  });
+
+  it('keeps custom and invited profiles unchanged when they use former factory choices', () => {
+    for (const kind of ['custom', 'invited'] as const) {
+      const id = `hero-${kind}-outside-factory`;
+      syncTavernHeroStorageFromProfiles([{
+        ...legacyFactoryProfile(id, 'claude', 'claude-opus-4-8[1m]'), kind, effort: 'max',
+      }]);
+      expect(loadTavernHeroIncarnationProfile(id)).toMatchObject({
+        model: 'claude-opus-4-8[1m]', effort: 'max', kind,
+      });
+    }
   });
 });
 

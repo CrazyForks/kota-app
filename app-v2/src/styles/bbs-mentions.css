@@ -43,7 +43,7 @@
 .bbs-mentions-warning { margin: 0; padding: 7px 12px; color: rgb(209,165,139); font-size: 10px; background: rgba(216,139,106,.04); }
 .bbs-mentions-summary { margin: 0 1px; padding: 1px 0 1px 10px; max-height: 110px; overflow: auto; scrollbar-width: thin; border-left: 2px solid rgb(141,101,78); }
 .bbs-mentions-group { display: flex; align-items: flex-start; gap: 13px; margin: 4px 0; }
-.bbs-mentions-route { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 192px; max-width: 240px; margin-top: 3px; color: var(--text-3); font-size: 10px; overflow-wrap: anywhere; }
+.bbs-mentions-route { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; max-width: 240px; margin-top: 3px; color: var(--text-3); font-size: 10px; overflow-wrap: anywhere; }
 .bbs-mentions-route svg { color: var(--text-4); width: 12px; height: 12px; }
 .bbs-mentions-route .bbs-mentions-slash { color: rgb(104,97,88); }
 .bbs-mentions-route > span:last-child { color: rgb(199,178,158); }

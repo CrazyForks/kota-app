@@ -651,7 +651,7 @@ impl AgentBusManager {
         };
         let payload = render_terminal_message_with_body_at(message, &body, now);
         let input = format!("{BRACKETED_PASTE_START}{payload}{BRACKETED_PASTE_END}");
-        match submit_to_agent(app, pty, &message.target_agent_id, &input) {
+        match submit_to_agent(app, pty, &message.target_agent_id, &input, &message.intent) {
             Ok(()) => return Ok(()),
             Err(first_err) => {
                 let Some(launch_request) = message.launch_request.clone() else {
@@ -659,14 +659,14 @@ impl AgentBusManager {
                 };
                 pty.agent_spawn(app, launch_request)?;
                 thread::sleep(AGENT_BUS_RESUME_GRACE);
-                submit_to_agent(app, pty, &message.target_agent_id, &input)
+                submit_to_agent(app, pty, &message.target_agent_id, &input, &message.intent)
             }
         }
     }
 }
 
-fn submit_to_agent(app: &AppHandle, pty: &PtyManager, agent_id: &str, input: &str) -> Result<()> {
-    pty.agent_submit_prompt(app, agent_id.to_string(), input.to_string())
+fn submit_to_agent(app: &AppHandle, pty: &PtyManager, agent_id: &str, input: &str, intent: &str) -> Result<()> {
+    pty.agent_submit_bus_prompt(app, agent_id, input.to_string(), intent)
 }
 
 fn actor_uses_temporal_gap(is_project_agent: bool, actor_id: &str, intent: &str) -> bool {

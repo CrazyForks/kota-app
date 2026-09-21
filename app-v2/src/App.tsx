@@ -58,7 +58,6 @@ import {
   archiveProjectAgent,
   archiveWorkspaceProject,
   callBackProjectAgent,
-  clearProjectAgentSessionMetadata,
   commendProjectAgent,
   dismissProjectAgent,
   emberSchedulerTick,
@@ -115,9 +114,9 @@ import type { Project, ProjectId } from './types/project';
 import type { WorkingHero } from './types/agentbar';
 import {
   composeProjectAgentName,
-  projectSurnameLabel,
-  projectAgentNameFields,
+  incarnationNameFields,
   splitProjectAgentName,
+  type ProjectAgentNameFields,
 } from './chrome/ProjectAgentName';
 import { avatarClassForId, refreshUserHeroAvatars } from './lib/hero-avatars';
 import { emitVioletComposerSent } from './chrome/violet-room-events';
@@ -229,6 +228,7 @@ const ROMAN_SUFFIXES: Record<number, string> = {
 interface IncarnationLaunchProfile {
   templateId: string;
   displayName: string;
+  nameFields: ProjectAgentNameFields;
   profile: TavernHeroProfileDraft;
 }
 
@@ -458,15 +458,14 @@ function makeIncarnationProgressId(): string {
   return `incarnation-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function incarnationName(baseName: string, index: number, projectName?: string | null): string {
-  const fields = projectAgentNameFields(baseName);
+function incarnationFields(
+  baseName: string,
+  index: number,
+  projectName?: string | null,
+  fields?: ProjectAgentNameFields,
+): ProjectAgentNameFields {
   const suffix = index <= 1 ? '' : ` ${ROMAN_SUFFIXES[index] ?? index}`;
-  const project = projectSurnameLabel(projectName);
-  return composeProjectAgentName({
-    ...fields,
-    given: `${fields.given || baseName.trim() || 'Agent'}${suffix}`,
-    surname: project ? `v. ${project}` : '',
-  });
+  return incarnationNameFields(baseName, fields, suffix, projectName);
 }
 
 function profileDraftForIncarnation(
@@ -476,6 +475,7 @@ function profileDraftForIncarnation(
   return {
     heroId: templateId,
     name: profile.name,
+    nameFields: profile.nameFields,
     provider: profile.provider,
     model: profile.model,
     effort: profile.effort ?? null,
@@ -2526,7 +2526,9 @@ export function App() {
         const nextWorkspace = remainingTabs[0] ?? null;
         if (nextWorkspace) {
           try {
-            adoptWorkspace(await openWorkspaceProject(nextWorkspace.projectId));
+            // Restore the destination's saved room state just like selecting
+            // its tab; resetting the archived room must not expand its terminals.
+            switchToWorkspace(await openWorkspaceProject(nextWorkspace.projectId));
           } catch (err) {
             console.warn('[workspace] could not activate next project after archive', err);
             setActiveWorkspace(null);
@@ -2545,13 +2547,13 @@ export function App() {
     }
   }, [
     activeWorkspace?.projectId,
-    adoptWorkspace,
     confirmInApp,
     dismissAgentSessions,
     focusComposerEndSoon,
     forgetWorkspaceTab,
     refreshFileTree,
     resetRoomUiState,
+    switchToWorkspace,
     visibleWorkspaceTabs,
   ]);
 
@@ -3311,6 +3313,7 @@ export function App() {
             agentId,
             templateId: incarnation.templateId,
             displayName: incarnation.displayName,
+            nameFields: incarnation.nameFields,
             projectRoot: activeWorkspace ? null : recruitProjectRoot,
             progressId: progress?.progressId,
             profile: incarnation.profile,
@@ -3426,6 +3429,10 @@ export function App() {
       phase: 'running',
     });
     const templateId = hero.templateId ?? hero.id;
+    const profile = loadTavernHeroIncarnationProfile(templateId);
+    const fieldsForIndex = (index: number) => incarnationFields(
+      profile?.name ?? hero.name, index, activeProjectName, profile?.nameFields,
+    );
     let existingProjectAgents: ProjectAgentIdentity[] = [];
     try {
       existingProjectAgents = await listProjectAgentIdentities(projectAgentRoot);
@@ -3451,7 +3458,7 @@ export function App() {
     ].filter(Boolean));
     let nameIndex = 1;
     let guard = 0;
-    while (occupiedNames.has(incarnationName(hero.name, nameIndex, activeProjectName).trim().toLowerCase())) {
+    while (occupiedNames.has(composeProjectAgentName(fieldsForIndex(nameIndex)).trim().toLowerCase())) {
       nameIndex += 1;
       guard += 1;
       if (guard > 1000) {
@@ -3469,7 +3476,8 @@ export function App() {
         return;
       }
     }
-    const displayName = incarnationName(hero.name, nameIndex, activeProjectName);
+    const nameFields = fieldsForIndex(nameIndex);
+    const displayName = composeProjectAgentName(nameFields);
     const agentId = mintProjectAgentId(occupiedIds) as AgentId;
     setIncarnationProgress((prev) => (
       prev?.id === progressId
@@ -3485,7 +3493,6 @@ export function App() {
       templateId,
       name: displayName,
     };
-    const profile = loadTavernHeroIncarnationProfile(templateId);
     const ok = await handleRecruitTest(
       agentId,
       profile?.cli ?? hero.cli,
@@ -3494,6 +3501,7 @@ export function App() {
         ? {
             templateId,
             displayName: instance.name,
+            nameFields,
             profile: profileDraftForIncarnation(templateId, profile),
           }
         : undefined,
@@ -3566,7 +3574,7 @@ export function App() {
       });
       const recruited = await recruitWithLeaseTakeover(result.request);
       if (!recruited) return false;
-      const detail = await clearProjectAgentSessionMetadata({
+      const detail = await loadProjectAgentDetail({
         agentId: id,
         projectRoot: projectAgentRoot,
       });
@@ -3580,7 +3588,6 @@ export function App() {
     }
   }, [
     applyProjectAgentDetail,
-    clearProjectAgentSessionMetadata,
     projectAgentRoot,
     recruitWithLeaseTakeover,
     refreshAgentPtySummaries,
@@ -3695,7 +3702,7 @@ export function App() {
     const name = agentName(id);
     const confirmed = await confirmInApp(
       `Start fresh session for ${name}?`,
-      'This will end the current terminal session and open a new provider session. Workspace files, adapter, skills, and project memory stay unchanged.',
+      'This will end the current terminal session and apply the saved provider, model, and effort in a fresh session. Your identity, Ghost, workspace files, and project memory stay unchanged.',
       {
         cancelLabel: 'Cancel',
         confirmLabel: 'Start Fresh Session',

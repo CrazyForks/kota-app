@@ -17,6 +17,8 @@ pub mod ember;
 mod integrations;
 mod orchestrator;
 mod pty;
+mod tavern_invite;
+mod shell_switch;
 mod temporal_context;
 mod violet;
 
@@ -451,6 +453,8 @@ struct TavernIncarnateHeroRequest {
     template_id: String,
     display_name: String,
     #[serde(default)]
+    name_fields: Option<ProjectAgentNameFieldsWire>,
+    #[serde(default)]
     project_root: Option<String>,
     #[serde(default)]
     progress_id: Option<String>,
@@ -544,6 +548,8 @@ struct TemporalContextPreparedPrompt {
 struct ProjectAgentSaveRequest {
     agent_id: String,
     #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
     project_root: Option<String>,
     display_name: String,
     #[serde(default)]
@@ -585,8 +591,6 @@ struct ProjectAgentInviteRequest {
     project_root: Option<String>,
     #[serde(default)]
     display_name: Option<String>,
-    #[serde(default)]
-    force_duplicate: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -3326,6 +3330,7 @@ fn materialize_tavern_incarnation(
         project_remote: ctx.project_remote.clone(),
         project_base_ref: Some(ctx.project_base_ref.clone()),
         takeover: false,
+        fresh_session: false,
     };
     if let (Some(project_id), Some(project_remote)) =
         (ctx.project_id.clone(), ctx.project_remote.clone())
@@ -3380,6 +3385,29 @@ fn cli_from_shell(
         "kimi" | "kimi-code" => Ok(pty::agent::AgentCli::Kimi),
         other => Err(format!("unsupported SHELL provider/command: {other}")),
     }
+}
+
+fn resolve_shell_context(
+    manager: &IntegrationManager,
+    requested_project_root: Option<&str>,
+    agent_id: &str,
+) -> Result<IncarnationContext, String> {
+    if let Some(root) = requested_project_root.filter(|s| !s.trim().is_empty()) {
+        let root = PathBuf::from(root);
+        if !root.is_absolute() || agent_id.is_empty()
+            || !agent_id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
+            return Err("invalid project agent target".into());
+        }
+        let root = root.canonicalize().map_err(|e| e.to_string())?;
+        let active = manager.workspace_status().active;
+        if active.as_ref().is_none_or(|w| Path::new(&w.local_root).canonicalize().ok().as_ref() != Some(&root)) {
+            let mut ctx = sync_context(&root);
+            ctx.cwd = root.join(".agent-workspaces").join(agent_id);
+            ctx.worktree_root = ctx.cwd.join("project-files");
+            return Ok(ctx);
+        }
+    }
+    resolve_incarnation_context(manager, requested_project_root, agent_id)
 }
 
 fn resolve_incarnation_context(
@@ -3614,8 +3642,13 @@ fn project_account_skills(
     let cwd = cwd.to_path_buf();
     let skills = skills.to_vec();
     adapter_sync::call(move || {
+        let metadata_lock = shell_switch::metadata_lock(&cwd);
+        let state = metadata_lock.lock().unwrap();
         if cwd.join("SHELL.yaml").is_file() {
             let (shell, cli) = read_skill_config(&cwd)?;
+            if state.starting.is_some() {
+                return Ok(SkillProjection { matched: Vec::new(), missing: Vec::new() });
+            }
             project_account_skills_inner(&cwd, cli, &shell.skills)
         } else if !cwd.join("agent.yaml").exists() {
             // Initial incarnation, before either source file is materialized.
@@ -3650,7 +3683,13 @@ fn project_account_skills_from_pool(
     fs::create_dir_all(&active_dir)
         .map_err(|err| format!("create {}: {err}", active_dir.display()))?;
     prune_stale_kota_skill_links(&active_dir, &requested, &[&account_skills], &[])?;
-    prune_inactive_skill_projection(cwd, &inactive_dir, &account_skills, &active_dir)?;
+    // Detail hydration may prepare the saved target before it is applied.
+    // Keep the live shell's links until a successful startup changes provider.
+    let applied = read_yaml_mapping(&cwd.join("agent.yaml")).ok()
+        .map(|yaml| shell_switch::effective_provider(&yaml)).transpose()?.flatten();
+    if applied.is_none_or(|applied| applied == cli) {
+        prune_inactive_skill_projection(cwd, &inactive_dir, &account_skills, &active_dir)?;
+    }
 
     let mut matched = Vec::new();
     let mut missing = Vec::new();
@@ -3722,7 +3761,12 @@ fn read_skill_config(cwd: &Path) -> Result<(ShellYaml, pty::agent::AgentCli), St
 fn sync_agent_skills(key: &adapter_sync::AgentKey) -> Result<(), String> {
     debug_assert!(adapter_sync::on_worker());
     let cwd = key.project.join(".agent-workspaces").join(&key.agent);
-    let (shell, cli) = read_skill_config(&cwd)?;
+    let lock = shell_switch::metadata_lock(&cwd);
+    let state = lock.lock().unwrap();
+    if state.starting.is_some() { return Ok(()); }
+    let (shell, target) = read_skill_config(&cwd)?;
+    let yaml = read_yaml_mapping(&cwd.join("agent.yaml"))?;
+    let cli = shell_switch::effective_provider(&yaml)?.unwrap_or(target);
     project_account_skills_inner(&cwd, cli, &shell.skills).map(|_| ())
 }
 
@@ -3852,7 +3896,12 @@ fn compile_agent_yaml(
         format!("recruited-at: {}", now),
         "status: active".into(),
     ];
-    if let Some(name_fields) = request.profile.name_fields.as_ref() {
+    if let Some(name_fields) = request.name_fields.as_ref().or_else(|| {
+        // Older callers only sent template fields. They apply only if the name is unchanged.
+        (request.display_name == request.profile.name)
+            .then_some(request.profile.name_fields.as_ref())
+            .flatten()
+    }) {
         lines.push("display-name-fields:".into());
         if let Some(title_id) = name_fields
             .title_id
@@ -5870,7 +5919,7 @@ fn load_project_agent_detail_with_repairs(
     agent_id: &str,
     repair: bool,
 ) -> Result<ProjectAgentDetail, String> {
-    let ctx = resolve_incarnation_context(manager, requested_project_root, agent_id)?;
+    let ctx = resolve_shell_context(manager, requested_project_root, agent_id)?;
     load_project_agent_detail_in_context(ctx, agent_id, repair)
 }
 
@@ -5896,6 +5945,8 @@ fn load_project_agent_detail_in_context(
         let projection_ctx = ctx.clone();
         let hydration_agent = agent_id.to_string();
         adapter_sync::call(move || {
+            let metadata_lock = shell_switch::metadata_lock(&shell_cwd);
+            let metadata_guard = metadata_lock.lock().unwrap();
             let identity = read_yaml_mapping(&shell_cwd.join("agent.yaml"))?;
             let shell_text = fs::read_to_string(&normalized_path)
                 .map_err(|error| format!("read {}: {error}", normalized_path.display()))?;
@@ -5904,7 +5955,9 @@ fn load_project_agent_detail_in_context(
             normalize_shell_for_cli(&mut shell, cli);
             persist_normalized_shell_if_changed(&normalized_path, &shell_text, &shell)?;
             ensure_project_projections(&projection_ctx)?;
-            if let Err(error) = project_account_skills_inner(&shell_cwd, cli, &shell.skills) {
+            if let Err(error) = if metadata_guard.starting.is_none() {
+                project_account_skills_inner(&shell_cwd, cli, &shell.skills).map(|_| ())
+            } else { Ok(()) } {
                 kota_debug_log(&format!(
                     "[adapter-sync] agent={hydration_agent} hydration skills: {error}"
                 ));
@@ -5919,7 +5972,7 @@ fn load_project_agent_detail_in_context(
         normalize_shell_for_cli(&mut shell, cli);
         (shell, cli)
     };
-    let adapter_path = existing_adapter_path(&ctx.cwd, cli);
+    let adapter_path = existing_adapter_path(&ctx.cwd, shell_switch::effective_provider(&agent_yaml)?.unwrap_or(cli));
     let adapter_text = fs::read_to_string(&adapter_path).unwrap_or_default();
     let ghost = extract_adapter_ghost(&adapter_text).unwrap_or_else(|| {
         adapter_text
@@ -5970,8 +6023,12 @@ fn load_project_agent_detail_in_context(
         .clone()
         .or_else(|| yaml_string(&agent_yaml, "model"))
         .unwrap_or_else(|| "default".into());
-    let invite_eligibility =
-        project_agent_invite_eligibility(&ghost, &source_hero_name, &project_name);
+    let invite_eligibility = tavern_invite::eligibility(
+        &kota_home_dir().join("heroes"),
+        tavern_invite::hero_id(ctx.project_id.as_deref(), &ctx.project_root, agent_id),
+        &display_name,
+        &ghost,
+    )?;
     let avatar_id =
         yaml_string(&agent_yaml, "avatar-id").or_else(|| yaml_string(&agent_yaml, "avatarId"));
 
@@ -6082,11 +6139,19 @@ fn save_project_agent_detail(
         &request.display_name,
     )?;
     let ctx =
-        resolve_incarnation_context(manager, request.project_root.as_deref(), &request.agent_id)?;
+        resolve_shell_context(manager, request.project_root.as_deref(), &request.agent_id)?;
     let agent_yaml_path = ctx.cwd.join("agent.yaml");
-    let mut agent_yaml = read_yaml_mapping(&agent_yaml_path).unwrap_or_default();
-    let previous_provider =
-        yaml_string(&agent_yaml, "provider").or_else(|| yaml_string(&agent_yaml, "shell"));
+    let metadata_lock = shell_switch::metadata_lock(&ctx.cwd);
+    let metadata_guard = metadata_lock.lock().unwrap();
+    let mut agent_yaml = read_yaml_mapping(&agent_yaml_path)?;
+    let shell_path = ctx.cwd.join("SHELL.yaml");
+    let mut shell = parse_shell_yaml(&fs::read_to_string(&shell_path).map_err(|e| e.to_string())?)?;
+    let previous_shell = shell.clone();
+    let previous_cli = cli_from_project_agent_files(&ctx.cwd, &shell, &agent_yaml)?;
+    shell_switch::preserve_legacy_provider(&ctx.cwd, &mut agent_yaml, &shell,
+        pty::agent::live_provider_for(&ctx.project_root, &request.agent_id, &ctx.cwd))?;
+    let active_cli = shell_switch::effective_provider(&agent_yaml)?.unwrap_or(previous_cli);
+    let cli = request.provider.as_deref().map(cli_from_shell_name).transpose()?.unwrap_or(previous_cli);
     let previous_display_name = yaml_string(&agent_yaml, "display-name")
         .or_else(|| yaml_string(&agent_yaml, "displayName"))
         .unwrap_or_else(|| request.agent_id.clone());
@@ -6119,22 +6184,18 @@ fn save_project_agent_detail(
     } else {
         yaml_remove(&mut agent_yaml, "avatar-id");
     }
-    for key in ["shell", "provider", "model", "effort", "skills"] {
+    for key in ["model", "effort", "skills"] {
         yaml_remove(&mut agent_yaml, key);
     }
     write_yaml_mapping(&agent_yaml_path, &agent_yaml)?;
 
-    let shell_path = ctx.cwd.join("SHELL.yaml");
-    let mut shell = fs::read_to_string(&shell_path)
-        .ok()
-        .and_then(|text| serde_yaml::from_str::<ShellYaml>(&text).ok())
-        .unwrap_or_default();
-    let provider_filled = shell.provider.is_none();
-    if provider_filled {
-        shell.provider = Some(previous_provider.unwrap_or_else(|| "codex".into()));
+    if cli != previous_cli {
+        // Provider-specific flags never cross shells. The six-provider defaults
+        // are filled by the editor; explicit model/effort still remain editable.
+        shell.args.clear();
+        shell.command = Some(cli.bin().into());
     }
-    let cli = cli_from_project_agent_files(&ctx.cwd, &shell, &agent_yaml)?;
-    let previous_shell = shell.clone();
+    shell.provider = Some(shell_name_for_cli(cli).into());
     shell.model = Some(normalize_model_for_cli(cli, model).to_string());
     shell.effort = next_effort;
     shell.skills = next_skills;
@@ -6142,13 +6203,9 @@ fn save_project_agent_detail(
     let skills_changed = previous_shell.skills != shell.skills;
     let shell_changed = previous_shell != shell;
     if shell_changed {
-        fs::write(&shell_path, compile_shell_yaml_text(&shell))
-            .map_err(|err| format!("write {}: {err}", shell_path.display()))?;
+        adapter_sync::atomic_replace(&shell_path, compile_shell_yaml_text(&shell).as_bytes())?;
     }
-    if skills_changed {
-        project_account_skills(&ctx.cwd, cli, &shell.skills)?;
-    }
-    let adapter_path = existing_adapter_path(&ctx.cwd, cli);
+    let adapter_path = existing_adapter_path(&ctx.cwd, active_cli);
     let adapter_text = fs::read_to_string(&adapter_path)
         .map_err(|err| format!("read {}: {err}", adapter_path.display()))?;
     let previous_ghost = extract_adapter_ghost(&adapter_text).unwrap_or_else(|| {
@@ -6173,6 +6230,10 @@ fn save_project_agent_detail(
             adapter_text
         };
         adapter_sync::write_if_changed(&adapter_path, adapter_text.as_bytes())?;
+    }
+    drop(metadata_guard);
+    if skills_changed {
+        project_account_skills(&ctx.cwd, cli, &shell.skills)?;
     }
     if ghost_changed || name_changed || shell_changed || skills_changed {
         regenerate_project_adapters_in_root(&ctx.project_root)
@@ -6425,6 +6486,9 @@ fn sync_one_project_adapter(
     inputs: &AdapterInputs,
 ) -> Result<(), String> {
     let cwd = project_root.join(".agent-workspaces").join(agent_id);
+    let metadata_lock = shell_switch::metadata_lock(&cwd);
+    let metadata_guard = metadata_lock.lock().unwrap();
+    if metadata_guard.starting.is_some() { return Ok(()); }
     let agent_yaml_path = cwd.join("agent.yaml");
     let agent_yaml = read_yaml_mapping(&agent_yaml_path)?;
     let identity = adapter_identity_fields(&agent_yaml, agent_id);
@@ -6436,7 +6500,9 @@ fn sync_one_project_adapter(
         &fs::read_to_string(&shell_path)
             .map_err(|err| format!("read {}: {err}", shell_path.display()))?,
     )?;
-    let cli = cli_from_project_agent_files(&cwd, &shell, &agent_yaml)?;
+    let cli = shell_switch::effective_provider(&agent_yaml)?
+        .unwrap_or(cli_from_project_agent_files(&cwd, &shell, &agent_yaml)?);
+    shell.provider = Some(shell_name_for_cli(cli).into());
     normalize_shell_for_cli(&mut shell, cli);
     let display_name = identity.display_name;
     let source_hero_id = identity.source_hero_id;
@@ -6461,6 +6527,7 @@ fn sync_one_project_adapter(
         agent_id: agent_id.to_string(),
         template_id: source_hero_id,
         display_name,
+        name_fields: yaml_value(&agent_yaml, "display-name-fields"),
         project_root: Some(path_string(project_root)),
         progress_id: None,
         profile: TavernHeroProfileDraft {
@@ -6541,6 +6608,20 @@ fn claude_resume_target_availability(
     if launch.cli != pty::agent::AgentCli::Claude {
         return ResumeTargetAvailability::Unknown;
     }
+    // A saved provider change will be applied at actual startup. Its current
+    // session belongs to the applied provider, not to this saved target; do not
+    // show a false "cannot resume Claude" confirmation for that old session.
+    let identity = Path::new(&launch.project_root)
+        .join(".agent-workspaces")
+        .join(&launch.agent_id)
+        .join("agent.yaml");
+    if read_yaml_mapping(&identity)
+        .ok()
+        .and_then(|yaml| shell_switch::effective_provider(&yaml).ok().flatten())
+        .is_some_and(|applied| applied != launch.cli)
+    {
+        return ResumeTargetAvailability::Unknown;
+    }
     if claude_args_request_resume(&launch.args) || claude_args_request_subcommand(&launch.args) {
         return ResumeTargetAvailability::Unknown;
     }
@@ -6599,7 +6680,7 @@ fn resolve_project_agent_launch_with_mode(
     if detail.status == "archived" {
         return Err(format!("agent is archived: {}", detail.display_name));
     }
-    let ctx = resolve_incarnation_context(manager, requested_project_root, agent_id)?;
+    let ctx = resolve_shell_context(manager, requested_project_root, agent_id)?;
     ensure_incarnation_project_files_worktree(&ctx, agent_id)?;
     let launch_cwd = launch_cwd_for_cli(detail.cli, &ctx, agent_id)?;
     let reset_pending = project_agent_session_reset_pending(&ctx.cwd);
@@ -6645,6 +6726,7 @@ fn resolve_project_agent_launch_with_mode(
         project_remote: ctx.project_remote,
         project_base_ref: Some(ctx.project_base_ref),
         takeover: false,
+        fresh_session: mode == ProjectAgentLaunchMode::Fresh,
     })
 }
 
@@ -7113,46 +7195,8 @@ fn invite_project_agent_to_tavern(
 ) -> Result<ProjectAgentInviteResult, String> {
     let detail =
         load_project_agent_detail(manager, request.project_root.as_deref(), &request.agent_id)?;
-    if !detail.invite_eligibility.eligible && !request.force_duplicate {
-        return Err(detail
-            .invite_eligibility
-            .reason
-            .unwrap_or_else(|| "this incarnation is not eligible to invite".into()));
-    }
-    let requested_display_name = request
-        .display_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .unwrap_or(&detail.invite_eligibility.proposed_display_name)
-        .to_string();
-    let display_name = unique_tavern_display_name(&requested_display_name);
-    let hero_id = unique_tavern_hero_id(&format!("hero-{}", slugify(&display_name)));
-    let shell = fs::read_to_string(&detail.shell_path)
-        .map_err(|err| format!("read {}: {err}", detail.shell_path))?;
-    let profile = TavernHeroProfileDraft {
-        hero_id: hero_id.clone(),
-        name: display_name.clone(),
-        name_fields: None,
-        provider: detail.provider.clone(),
-        model: detail.model.clone(),
-        effort: detail.effort.clone(),
-        avatar_id: detail.avatar_id.clone(),
-        skills: detail.skills.clone(),
-        ghost: detail.ghost.clone(),
-        shell,
-        archived: false,
-        dismissed: false,
-        kind: Some("invited".into()),
-        record: None,
-    };
-    save_tavern_hero_profile(&profile)?;
-    Ok(ProjectAgentInviteResult {
-        hero_id: hero_id.clone(),
-        display_name,
-        path: path_string(&tavern_hero_dir(&hero_id)),
-        duplicate_hero_id: detail.invite_eligibility.duplicate_hero_id,
-    })
+    let profile = tavern_invite::snapshot(&detail, request.display_name.as_deref())?;
+    tavern_invite::save(&kota_home_dir().join("heroes"), profile)
 }
 
 fn kage_bunshin_project_agent(
@@ -7276,6 +7320,7 @@ fn kage_bunshin_project_agent(
         project_remote: clone_ctx.project_remote,
         project_base_ref: Some(clone_ctx.project_base_ref),
         takeover: false,
+        fresh_session: false,
     };
     let clone_detail =
         load_project_agent_detail(manager, request.project_root.as_deref(), &clone_id)?;
@@ -8262,9 +8307,10 @@ fn latest_kimi_session_id_in(kimi_home: &Path, cwd: &Path) -> Result<Option<Stri
                 continue;
             };
             if !state
-                .get("workDir")
+                .get("cwd")
+                .or_else(|| state.get("workDir"))
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|work_dir| paths_same(Path::new(work_dir), cwd))
+                .is_some_and(|session_cwd| paths_same(Path::new(session_cwd), cwd))
             {
                 continue;
             }
@@ -8511,99 +8557,14 @@ fn ensure_unique_project_agent_display_name(
     Ok(())
 }
 
-fn project_agent_invite_eligibility(
-    ghost: &str,
-    source_hero_name: &str,
-    project_name: &str,
-) -> ProjectAgentInviteEligibility {
-    let proposed_display_name = unique_tavern_display_name(&format!(
-        "{} v. {}",
-        base_hero_name(source_hero_name),
-        project_name
-    ));
-    let proposed_hero_id = unique_tavern_hero_id(&slugify(&proposed_display_name));
-    if ghost.trim().is_empty() {
-        return ProjectAgentInviteEligibility {
-            eligible: false,
-            reason: Some("GHOST/persona section is empty".into()),
-            duplicate_hero_id: None,
-            proposed_hero_id,
-            proposed_display_name,
-        };
-    }
-    let duplicate_hero_id = duplicate_tavern_ghost_hero_id(ghost);
-    ProjectAgentInviteEligibility {
-        eligible: duplicate_hero_id.is_none(),
-        reason: duplicate_hero_id
-            .as_ref()
-            .map(|id| format!("same GHOST already exists in Tavern as {id}")),
-        duplicate_hero_id,
-        proposed_hero_id,
-        proposed_display_name,
-    }
-}
-
-fn duplicate_tavern_ghost_hero_id(ghost: &str) -> Option<String> {
-    let hash = sha256_hex(ghost.trim().as_bytes());
-    let heroes_root = kota_home_dir().join("heroes");
-    let entries = fs::read_dir(heroes_root).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let ghost_path = path.join("GHOST.md");
-        let content = fs::read_to_string(&ghost_path).ok()?;
-        if sha256_hex(content.trim().as_bytes()) == hash {
-            return path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned());
-        }
-    }
-    None
-}
-
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
 }
 
-fn unique_tavern_display_name(base: &str) -> String {
-    let mut existing = std::collections::HashSet::new();
-    if let Ok(entries) = fs::read_dir(kota_home_dir().join("heroes")) {
-        for entry in entries.flatten() {
-            if let Ok(Some(profile)) = load_tavern_hero_profile(&entry.path()) {
-                if !tavern_profile_reserves_display_name(&profile) {
-                    continue;
-                }
-                existing.insert(tavern_display_name_key(&profile.name));
-            }
-        }
-    }
-    unique_name_with_roman_suffix(base, |name| {
-        existing.contains(&tavern_display_name_key(name))
-    })
-}
-
 fn project_agent_status_reserves_display_name(status: &str) -> bool {
     matches!(status.trim().to_lowercase().as_str(), "active" | "archived")
-}
-
-fn unique_tavern_hero_id(base: &str) -> String {
-    let base = if base.trim().is_empty() { "hero" } else { base };
-    let mut index = 1;
-    loop {
-        let candidate = if index <= 1 {
-            base.to_string()
-        } else {
-            format!("{}-{}", base, index)
-        };
-        if !tavern_hero_dir(&candidate).exists() {
-            return candidate;
-        }
-        index += 1;
-    }
 }
 
 fn unique_name_with_roman_suffix<F>(base: &str, exists: F) -> String
@@ -8640,10 +8601,6 @@ fn roman_suffix(index: usize) -> Option<String> {
         10 => Some("X".into()),
         _ => None,
     }
-}
-
-fn base_hero_name(name: &str) -> String {
-    name.split(" v. ").next().unwrap_or(name).trim().to_string()
 }
 
 fn slugify(value: &str) -> String {
@@ -9081,6 +9038,7 @@ fn default_model_options(provider: &str) -> Vec<SupportedProviderModel> {
         ],
         "antigravity" => vec![model("default", "Antigravity default", "kota seed")],
         "opencode" => vec![
+            model("default", "CLI default", "kota seed"),
             model(
                 "opencode/deepseek-v4-flash-free",
                 "opencode/deepseek-v4-flash-free",
@@ -9105,6 +9063,7 @@ fn default_model_options(provider: &str) -> Vec<SupportedProviderModel> {
             ),
         ],
         "pi" => vec![
+            model("default", "CLI default", "kota seed"),
             model(PI_DEFAULT_MODEL, "GLM-5.2", "kota fallback"),
             model("zai/glm-5.1", "GLM-5.1", "kota fallback"),
             model("zai/glm-5-turbo", "GLM-5-Turbo", "kota fallback"),
@@ -10093,15 +10052,22 @@ async fn pty_agent_spawn(
 }
 
 #[tauri::command]
-fn pty_agent_write(
+async fn pty_agent_write(
     app: tauri::AppHandle,
-    manager: State<'_, PtyManager>,
     agent_id: String,
     input: String,
 ) -> Result<(), String> {
-    manager
-        .agent_write(&app, agent_id, input)
-        .map_err(|err| err.to_string())
+    // Live keystrokes retain the direct write path. Only a process restart
+    // needs the blocking startup worker; do not queue a task per keystroke.
+    let Some(input) = app.state::<PtyManager>()
+        .agent_try_write_running(&app, &agent_id, input)
+        .map_err(|err| err.to_string())? else {
+        return Ok(());
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<PtyManager>().agent_write(&app, agent_id, input)
+            .map_err(|err| err.to_string())
+    }).await.map_err(|err| format!("join pty_agent_write: {err}"))?
 }
 
 #[tauri::command]
@@ -13385,6 +13351,7 @@ mod tests {
             agent_id: "agent-test".into(),
             template_id: "hero-test".into(),
             display_name: "Test Agent".into(),
+            name_fields: None,
             project_root: Some(path_string(&root)),
             progress_id: None,
             profile: TavernHeroProfileDraft {
@@ -13904,6 +13871,7 @@ zai          glm-5.2           1M       131.1K   yes       no
                 agent_id: "agent-existing".into(),
                 template_id: hero_id.clone(),
                 display_name: "Existing Agent".into(),
+                name_fields: None,
                 project_root: None,
                 progress_id: None,
                 profile: TavernHeroProfileDraft {
@@ -13951,6 +13919,7 @@ zai          glm-5.2           1M       131.1K   yes       no
             agent_id: "agent-123".into(),
             template_id: "hero-dex".into(),
             display_name: "Dex v. Kota".into(),
+            name_fields: None,
             project_root: None,
             progress_id: None,
             profile: TavernHeroProfileDraft {
@@ -14322,6 +14291,16 @@ zai          glm-5.2           1M       131.1K   yes       no
         .unwrap();
         fs::write(wrong.join("agents/main/wire.jsonl"), "{}\n{}\n").unwrap();
 
+        assert_eq!(
+            latest_kimi_session_id_in(&kimi_home, &cwd).unwrap(),
+            Some("session_kimi_match".into())
+        );
+
+        fs::write(
+            matching.join("state.json"),
+            serde_json::json!({"cwd": path_string(&cwd)}).to_string(),
+        )
+        .unwrap();
         assert_eq!(
             latest_kimi_session_id_in(&kimi_home, &cwd).unwrap(),
             Some("session_kimi_match".into())

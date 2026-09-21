@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from 'react';
 import {
@@ -27,6 +28,7 @@ import {
 import { ProjectAgentTitlePicker } from './ProjectAgentTitlePicker';
 import { HeroAvatarPicker } from './HeroAvatarPicker';
 import { SkillActivationList } from './SkillActivationList';
+import { syncTavernHeroStorageFromDisk } from './TavernModal';
 import type { AgentId } from '../types/scene';
 import iconCommends from '../assets/tavern/icons/commends.svg';
 import iconGhost from '../assets/tavern/icons/ghost.svg';
@@ -40,6 +42,11 @@ type ProjectAgentModelCache = Record<string, {
   updatedAt: number;
   models: SupportedProviderModel[];
 }>;
+
+const SHELL_PROVIDERS = [
+  ['claude', 'Claude Code'], ['codex', 'Codex'], ['antigravity', 'Antigravity'],
+  ['opencode', 'OpenCode'], ['pi', 'Pi'], ['kimi', 'Kimi Code'],
+] as const;
 
 const PROJECT_AGENT_MODEL_CACHE_KEY = 'kota-v2.project-agent.model-catalog-cache.v2';
 
@@ -62,6 +69,7 @@ export function ProjectAgentProfileOverlay({
 }: ProjectAgentProfileOverlayProps) {
   const [detail, setDetail] = useState<ProjectAgentDetail | null>(null);
   const [displayName, setDisplayName] = useState('');
+  const [provider, setProvider] = useState('');
   const [model, setModel] = useState('');
   const [effort, setEffort] = useState('');
   const [shellStatuses, setShellStatuses] = useState<SupportedShellStatus[]>([]);
@@ -78,6 +86,8 @@ export function ProjectAgentProfileOverlay({
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const inviteInFlight = useRef(false);
+  const saveInFlight = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -96,6 +106,7 @@ export function ProjectAgentProfileOverlay({
         const nextDisplayName = fullProjectAgentName(next.displayName, next.projectName);
         setDisplayName(nextDisplayName);
         setNameDraft(projectAgentNameFieldsFromDetail(next, nextDisplayName));
+        setProvider(next.provider);
         setModel(next.model);
         setEffort(next.effort ?? '');
         setAvatarId(next.avatarId ?? null);
@@ -127,9 +138,9 @@ export function ProjectAgentProfileOverlay({
   const canSaveName = !!detail && nameDraft.given.trim().length > 0 && !duplicateName && busy == null;
   const providerStatus = useMemo(() => {
     if (!detail) return null;
-    return shellStatuses.find((status) => status.id === detail.provider) ?? null;
-  }, [detail, shellStatuses]);
-  const modelCacheEntry = detail ? modelCache[detail.provider] : undefined;
+    return shellStatuses.find((status) => status.id === provider) ?? null;
+  }, [detail, provider, shellStatuses]);
+  const modelCacheEntry = detail ? modelCache[provider] : undefined;
   const modelOptions = useMemo(() => projectAgentModelOptions(
     providerStatus?.modelOptions ?? [],
     modelCacheEntry?.models ?? [],
@@ -142,7 +153,7 @@ export function ProjectAgentProfileOverlay({
   const modelCatalogStatus = detail
     ? projectAgentModelCatalogStatus(providerStatus?.modelOptions?.length ?? 0, modelCacheEntry)
     : '';
-  const modelRefreshing = !!detail && modelRefreshBusy === detail.provider;
+  const modelRefreshing = !!detail && modelRefreshBusy === provider;
 
   const setSkillActive = (skillId: string, active: boolean) => {
     const selected = skills.includes(skillId);
@@ -164,15 +175,15 @@ export function ProjectAgentProfileOverlay({
 
   const refreshModelCatalog = async () => {
     if (!detail || modelRefreshBusy) return;
-    setModelRefreshBusy(detail.provider);
+    setModelRefreshBusy(provider);
     setError(null);
     setNotice(null);
     try {
-      const models = await refreshProviderModelOptions(detail.provider);
+      const models = await refreshProviderModelOptions(provider);
       setModelCache((current) => {
         const next = {
           ...current,
-          [detail.provider]: {
+          [provider]: {
             updatedAt: Date.now(),
             models,
           },
@@ -183,13 +194,14 @@ export function ProjectAgentProfileOverlay({
     } catch (err) {
       setError(String(err));
     } finally {
-      setModelRefreshBusy((current) => (current === detail.provider ? null : current));
+      setModelRefreshBusy((current) => (current === provider ? null : current));
     }
   };
 
   const toggleShellEdit = async () => {
     if (!shellEditing) {
       if (detail) {
+        setProvider(detail.provider);
         setModel(detail.model);
         setEffort(detail.effort ?? '');
       }
@@ -201,13 +213,14 @@ export function ProjectAgentProfileOverlay({
     if (!detail || modelRefreshing) return;
     const nextModel = model.trim() || 'default';
     const nextEffort = effort.trim();
-    const saved = await save({ model: nextModel, effort: nextEffort || null });
+    const saved = await save({ provider, model: nextModel, effort: nextEffort || null });
     if (saved) {
       setShellEditing(false);
     }
   };
 
   const save = async (patch: {
+    provider?: string;
     displayName?: string;
     nameFields?: ProjectAgentNameFields | null;
     ghost?: string;
@@ -217,7 +230,8 @@ export function ProjectAgentProfileOverlay({
     model?: string;
     effort?: string | null;
   } = {}): Promise<boolean> => {
-    if (!detail) return false;
+    if (!detail || saveInFlight.current) return false;
+    const nextProvider = patch.provider ?? detail.provider;
     const nextDisplayName = (patch.displayName ?? displayName).trim();
     const nextGhost = patch.ghost ?? ghost;
     const nextAvatarId = patch.avatarId !== undefined ? patch.avatarId : avatarId;
@@ -235,6 +249,7 @@ export function ProjectAgentProfileOverlay({
     const modelChanged = detail.model !== nextModel;
     const effortChanged = (detail.effort ?? '') !== nextEffort;
     const changedNext =
+      nextProvider !== detail.provider ||
       nameChanged ||
       nameFieldsChanged ||
       modelChanged ||
@@ -246,6 +261,7 @@ export function ProjectAgentProfileOverlay({
       if (patch.closeGhost) setGhostExpanded(false);
       return !duplicateName && !!nextDisplayName.trim();
     }
+    saveInFlight.current = true;
     setBusy('save');
     setError(null);
     setNotice(null);
@@ -255,6 +271,7 @@ export function ProjectAgentProfileOverlay({
         projectRoot,
         displayName: nextDisplayName,
         nameFields: nextNameFields,
+        provider: nextProvider,
         model: nextModel,
         effort: nextEffort || null,
         avatarId: nextAvatarId,
@@ -266,6 +283,7 @@ export function ProjectAgentProfileOverlay({
       setDisplayName(savedDisplayName);
       setNameDraft(projectAgentNameFieldsFromDetail(next, savedDisplayName));
       setNameEditing(false);
+      if (patch.provider !== undefined) setProvider(next.provider);
       if (patch.model !== undefined) setModel(next.model);
       if (patch.effort !== undefined) setEffort(next.effort ?? '');
       setAvatarId(next.avatarId ?? null);
@@ -282,6 +300,7 @@ export function ProjectAgentProfileOverlay({
       setError(String(err));
       return false;
     } finally {
+      saveInFlight.current = false;
       setBusy(null);
     }
   };
@@ -309,7 +328,8 @@ export function ProjectAgentProfileOverlay({
   }, [flushSkillsAndClose]);
 
   const invite = async () => {
-    if (!detail || !detail.inviteEligibility.eligible) return;
+    if (inviteInFlight.current || busy != null || !detail?.inviteEligibility.eligible) return;
+    inviteInFlight.current = true;
     setBusy('invite');
     setError(null);
     setNotice(null);
@@ -317,12 +337,28 @@ export function ProjectAgentProfileOverlay({
       const result = await inviteProjectAgentToTavern({
         agentId,
         projectRoot,
-        displayName: detail.inviteEligibility.proposedDisplayName,
       });
+      setDetail((current) => current?.agentYamlPath === detail.agentYamlPath ? {
+        ...current,
+        inviteEligibility: {
+          eligible: false,
+          reason: 'This incarnation is already in Tavern.',
+          duplicateHeroId: result.heroId,
+          proposedHeroId: result.heroId,
+          proposedDisplayName: result.displayName,
+        },
+      } : current);
       setNotice(`Invited as ${result.displayName}`);
+      try {
+        await syncTavernHeroStorageFromDisk();
+      } catch {
+        // The invitation is already saved; a cache refresh failure must not invite again.
+        setNotice(`Invited as ${result.displayName}. Recruit list could not refresh; open Tavern to refresh it.`);
+      }
     } catch (err) {
       setError(String(err));
     } finally {
+      inviteInFlight.current = false;
       setBusy(null);
     }
   };
@@ -345,7 +381,7 @@ export function ProjectAgentProfileOverlay({
   const inviteReason = detail?.inviteEligibility.reason
     ?? (detail?.inviteEligibility.eligible ? 'Ready to invite this GHOST into Tavern.' : null);
   const profileDisplayName = displayName || detail?.displayName || agentId;
-  const shellProvider = projectAgentShellProviderMeta(detail);
+  const shellProvider = projectAgentShellProviderMeta(detail ? { ...detail, provider } : null);
   const startNameEdit = () => {
     setNameDraft(detail ? projectAgentNameFieldsFromDetail(detail, displayName) : projectAgentNameFields(displayName));
     setNameEditing(true);
@@ -394,7 +430,17 @@ export function ProjectAgentProfileOverlay({
                 <span className="project-agent-shell-provider-icon" aria-hidden="true" />
                 <span className="project-agent-shell-provider-copy">
                   <span className="project-agent-shell-provider-label">Provider</span>
-                  <span className="project-agent-shell-provider-name">{shellProvider.label}</span>
+                  {shellEditing ? (
+                    <select className="project-agent-shell-provider-select" aria-label="Provider" value={provider} disabled={busy != null}
+                      onChange={(event) => {
+                        const next = event.target.value;
+                        setProvider(next);
+                        setModel(next === detail?.provider ? detail.model : 'default');
+                        setEffort(next === detail?.provider ? detail.effort ?? '' : '');
+                      }}>
+                      {SHELL_PROVIDERS.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
+                    </select>
+                  ) : <span className="project-agent-shell-provider-name">{shellProvider.label}</span>}
                 </span>
               </div>
               {shellEditing ? (

@@ -14594,6 +14594,28 @@ body::before {
 .tavern-heading {
   min-width: 0;
 }
+.tavern-reset-heroes {
+  margin: 1px 0 18px;
+  text-align: center;
+}
+.tavern-reset-heroes button {
+  padding: 5px 10px;
+  border: 0;
+  background: none;
+  color: var(--text-4);
+  font: 12px var(--font-sans);
+  cursor: pointer;
+  text-underline-offset: 3px;
+}
+.tavern-reset-heroes button:hover:not(:disabled) {
+  color: var(--brass-hi);
+  text-decoration: underline;
+}
+.tavern-reset-heroes button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .tavern-provider-status {
   position: relative;
   z-index: 3;
@@ -16788,6 +16810,16 @@ body::before {
   text-overflow: ellipsis;
   text-transform: uppercase;
   white-space: nowrap;
+}
+.project-agent-shell-provider-select {
+  max-width: 100%;
+  min-width: 0;
+  padding: 6px 20px 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-base);
+  color: var(--text-2);
+  font: 14px/1.25 var(--font-display);
 }
 .project-agent-shell-edit-fields {
   display: grid;

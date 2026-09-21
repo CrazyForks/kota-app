@@ -1,0 +1,532 @@
+use super::*;
+
+struct Fixture {
+    root: PathBuf,
+    cwd: PathBuf,
+}
+impl Fixture {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!("kota-shell-switch-{}", Uuid::new_v4()));
+        let cwd = root.join(".agent-workspaces/agent-fixture73");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(root.join("project-memory/chathistory")).unwrap();
+        fs::create_dir_all(cwd.join("project-files/.git")).unwrap();
+        fs::write(cwd.join("AGENTS.md"), "<!-- kota:adapter:AGENTS.md -->\n<!-- kota:ghost:start -->\nIncarnation Ghost.\n<!-- kota:ghost:end -->\n").unwrap();
+        fs::write(cwd.join("agent.yaml"), "id: agent-fixture73\ndisplay-name: Tester\nprovider: codex\nshell: codex\nsession-id: old-session\nsession-source: native\nstatus: active\n").unwrap();
+        fs::write(
+            cwd.join("SHELL.yaml"),
+            "provider: codex\nmodel: default\nargs: []\n",
+        )
+        .unwrap();
+        Self { root, cwd }
+    }
+    fn target(&self, provider: &str) {
+        fs::write(
+            self.cwd.join("SHELL.yaml"),
+            format!("provider: {provider}\nmodel: default\nargs: []\n"),
+        )
+        .unwrap();
+    }
+    fn request(&self, fresh: bool) -> AgentSpawnRequest {
+        serde_json::from_value(serde_json::json!({
+            "agentId":"agent-fixture73", "cli":"codex", "cwd":self.cwd,
+            "projectRoot":self.root, "projectId":"fixture-zenith-river-73", "freshSession":fresh,
+            "sessionId":"old-session", "args":["resume", "old-session"]
+        }))
+        .unwrap()
+    }
+    fn yaml(&self) -> serde_yaml::Mapping {
+        read_yaml_mapping(&self.cwd.join("agent.yaml")).unwrap()
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let root = self.root.clone();
+        let _ = adapter_sync::call(move || {
+            adapter_sync::take_project(&root);
+            Ok(())
+        });
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn actual_save_and_reopen_keep_applied_shell_ghost_and_session_until_start() {
+    let f = Fixture::new();
+    let manager = IntegrationManager::default();
+    let save = |provider: &str| ProjectAgentSaveRequest {
+        agent_id: "agent-fixture73".into(),
+        project_root: Some(path_string(&f.root)),
+        provider: Some(provider.into()),
+        display_name: "Tester".into(),
+        name_fields: None,
+        model: "default".into(),
+        effort: None,
+        avatar_id: None,
+        skills: Vec::new(),
+        ghost: "Incarnation Ghost.".into(),
+    };
+    let initial =
+        load_project_agent_detail(&manager, Some(&path_string(&f.root)), "agent-fixture73")
+            .unwrap();
+    let saved = save_project_agent_detail(&manager, save("claude")).unwrap();
+    assert_eq!(saved.cli, AgentCli::Claude);
+    assert_eq!(saved.ghost, initial.ghost);
+    assert_eq!(saved.session_id, initial.session_id);
+    assert_eq!(
+        effective_provider(&f.yaml()).unwrap(),
+        Some(AgentCli::Codex)
+    );
+    assert!(yaml_value::<Handoff>(&f.yaml(), "handoff-pending").is_none());
+    assert!(f.cwd.join("AGENTS.md").is_file());
+    assert!(!f.cwd.join("CLAUDE.md").exists());
+    // A rule-change refresh must still use the applied provider.
+    regenerate_project_adapters_in_root(&f.root).unwrap();
+    assert!(!f.cwd.join("CLAUDE.md").exists());
+    save_project_agent_detail(&manager, save("codex")).unwrap();
+    let mut request = f.request(false);
+    assert!(!Launch::prepare(&mut request, None).unwrap().unwrap().fresh);
+    save_project_agent_detail(&manager, save("claude")).unwrap();
+    save_project_agent_detail(&manager, save("kimi")).unwrap();
+    let mut request = f.request(false);
+    let launch = Launch::prepare(&mut request, None).unwrap().unwrap();
+    assert_eq!(request.cli, AgentCli::Kimi);
+    assert!(launch
+        .handoff
+        .as_ref()
+        .unwrap()
+        .text
+        .contains("from codex to kimi"));
+}
+
+#[test]
+fn resolving_a_saved_provider_target_does_not_check_the_old_session_in_the_new_provider() {
+    let f = Fixture::new();
+    f.target("claude");
+    let before = fs::read(f.cwd.join("agent.yaml")).unwrap();
+    let request = resolve_project_agent_launch(
+        &IntegrationManager::default(),
+        Some(&path_string(&f.root)),
+        "agent-fixture73",
+    )
+    .unwrap();
+    assert_eq!(request.cli, AgentCli::Claude);
+    assert_eq!(request.session_id.as_deref(), Some("old-session"));
+    assert_eq!(
+        claude_resume_target_availability(&request),
+        ResumeTargetAvailability::Unknown
+    );
+    assert_eq!(fs::read(f.cwd.join("agent.yaml")).unwrap(), before);
+    assert!(yaml_value::<Handoff>(&f.yaml(), "handoff-pending").is_none());
+}
+
+#[test]
+fn ordinary_fresh_without_pending_keeps_identity_ghost_and_does_not_inject() {
+    let f = Fixture::new();
+    regenerate_project_adapters_in_root(&f.root).unwrap();
+    let shell_before = fs::read(f.cwd.join("SHELL.yaml")).unwrap();
+    let ghost_before = fs::read(f.cwd.join("AGENTS.md")).unwrap();
+    let mut request = f.request(true);
+    let mut launch = Launch::prepare(&mut request, None).unwrap().unwrap();
+    assert!(launch.fresh && launch.handoff.is_none());
+    assert_eq!(request.session_id, None);
+    assert_eq!(
+        request.args,
+        fresh_project_agent_launch_args(AgentCli::Codex, &[])
+    );
+    launch.prepare_adapter().unwrap();
+    launch.commit(None).unwrap();
+    drop(launch);
+    assert_eq!(
+        effective_provider(&f.yaml()).unwrap(),
+        Some(AgentCli::Codex)
+    );
+    assert_eq!(
+        yaml_string(&f.yaml(), "id").as_deref(),
+        Some("agent-fixture73")
+    );
+    assert_eq!(
+        yaml_string(&f.yaml(), "display-name").as_deref(),
+        Some("Tester")
+    );
+    assert!(yaml_string(&f.yaml(), "session-id").is_none());
+    assert!(yaml_string(&f.yaml(), "session-reset-at").is_some());
+    assert_eq!(fs::read(f.cwd.join("SHELL.yaml")).unwrap(), shell_before);
+    assert_eq!(fs::read(f.cwd.join("AGENTS.md")).unwrap(), ghost_before);
+    assert_eq!(
+        compose(
+            &f.cwd,
+            AgentCli::Codex,
+            "next input".into(),
+            PromptSource::Composer
+        )
+        .unwrap(),
+        ("next input".into(), None)
+    );
+}
+
+#[test]
+fn target_adapter_preserves_ghost_and_rollback_preserves_later_user_edits() {
+    let f = Fixture::new();
+    let mut yaml = f.yaml();
+    yaml_remove(&mut yaml, "display-name");
+    yaml_set_string(&mut yaml, "displayName", "Legacy Name");
+    write_yaml_mapping(&f.cwd.join("agent.yaml"), &yaml).unwrap();
+    f.target("claude");
+    let before = fs::read(f.cwd.join("AGENTS.md")).unwrap();
+    let mut req = f.request(false);
+    let mut launch = Launch::prepare(&mut req, None).unwrap().unwrap();
+    launch.prepare_adapter().unwrap();
+    assert!(fs::read_to_string(f.cwd.join("CLAUDE.md"))
+        .unwrap()
+        .contains("Incarnation Ghost."));
+    assert!(fs::read_to_string(f.cwd.join("CLAUDE.md"))
+        .unwrap()
+        .contains("You are Legacy Name, a Kota project agent."));
+    assert_eq!(fs::read(f.cwd.join("AGENTS.md")).unwrap(), before);
+    launch.rollback().unwrap();
+    assert!(!f.cwd.join("CLAUDE.md").exists());
+    let mut next = Launch::prepare(&mut f.request(false), None)
+        .unwrap()
+        .unwrap();
+    next.prepare_adapter().unwrap();
+    fs::write(f.cwd.join("CLAUDE.md"), "user changed this during startup").unwrap();
+    next.rollback().unwrap();
+    assert_eq!(
+        fs::read_to_string(f.cwd.join("CLAUDE.md")).unwrap(),
+        "user changed this during startup"
+    );
+    assert_eq!(fs::read(f.cwd.join("AGENTS.md")).unwrap(), before);
+}
+
+#[test]
+fn late_profile_edit_is_carried_forward_and_lifecycle_retirement_aborts_commit() {
+    let f = Fixture::new();
+    f.target("claude");
+    let mut launch = Launch::prepare(&mut f.request(false), None)
+        .unwrap()
+        .unwrap();
+    launch.prepare_adapter().unwrap();
+    let old = fs::read_to_string(f.cwd.join("AGENTS.md")).unwrap();
+    fs::write(
+        f.cwd.join("AGENTS.md"),
+        replace_adapter_ghost(&old, "Latest Ghost").unwrap(),
+    )
+    .unwrap();
+    launch.commit(None).unwrap();
+    assert!(fs::read_to_string(f.cwd.join("CLAUDE.md"))
+        .unwrap()
+        .contains("Latest Ghost"));
+    drop(launch);
+    f.target("codex");
+    let mut launch = Launch::prepare(&mut f.request(false), None)
+        .unwrap()
+        .unwrap();
+    let mut yaml = f.yaml();
+    yaml_set_string(&mut yaml, "status", "archived");
+    write_yaml_mapping(&f.cwd.join("agent.yaml"), &yaml).unwrap();
+    assert!(launch.commit(None).is_err());
+    assert_eq!(
+        effective_provider(&f.yaml()).unwrap(),
+        Some(AgentCli::Claude)
+    );
+}
+
+#[test]
+fn preparing_target_skills_keeps_applied_links_and_owned_cleanup_keeps_user_files() {
+    let f = Fixture::new();
+    let pool = f.root.join("skill-pool");
+    fs::create_dir_all(pool.join("s")).unwrap();
+    fs::write(pool.join("s/SKILL.md"), "skill").unwrap();
+    project_account_skills_from_pool(&f.cwd, AgentCli::Codex, &["s".into()], &pool).unwrap();
+    project_account_skills_from_pool(&f.cwd, AgentCli::Claude, &["s".into()], &pool).unwrap();
+    assert!(f.cwd.join(".agents/skills/s/SKILL.md").is_file());
+    assert!(f.cwd.join(".claude/skills/s/SKILL.md").is_file());
+    fs::create_dir_all(f.cwd.join(".agents/skills/user")).unwrap();
+    fs::write(f.cwd.join(".agents/skills/user/SKILL.md"), "user content").unwrap();
+    let mut yaml = f.yaml();
+    set_provider(&mut yaml, AgentCli::Claude);
+    write_yaml_mapping(&f.cwd.join("agent.yaml"), &yaml).unwrap();
+    project_account_skills_from_pool(&f.cwd, AgentCli::Claude, &["s".into()], &pool).unwrap();
+    assert!(!f.cwd.join(".agents/skills/s").exists());
+    assert!(f.cwd.join(".agents/skills/user/SKILL.md").is_file());
+}
+
+#[test]
+fn latest_target_is_pinned_only_at_start_and_completion_does_not_overwrite_later_save() {
+    let f = Fixture::new();
+    let mut req = f.request(false); // Stale bus fallback is resolved before Save.
+    f.target("claude");
+    let mut launch = Launch::prepare(&mut req, None).unwrap().unwrap();
+    assert_eq!(req.cli, AgentCli::Claude);
+    assert_eq!(req.session_id, None);
+    assert!(!req
+        .args
+        .iter()
+        .any(|a| a.contains("old-session") || a == "resume"));
+    assert!(launch.handoff.is_some());
+    assert_eq!(
+        effective_provider(&f.yaml()).unwrap(),
+        Some(AgentCli::Codex)
+    );
+    f.target("kimi");
+    launch.commit(None).unwrap();
+    assert_eq!(
+        effective_provider(&f.yaml()).unwrap(),
+        Some(AgentCli::Claude)
+    );
+    assert!(fs::read_to_string(f.cwd.join("SHELL.yaml"))
+        .unwrap()
+        .contains("kimi"));
+    let mut next = f.request(false);
+    let next = Launch::prepare(&mut next, None).unwrap().unwrap();
+    assert!(next
+        .handoff
+        .as_ref()
+        .unwrap()
+        .text
+        .contains("from claude to kimi"));
+}
+
+#[test]
+fn saving_back_to_applied_provider_does_not_switch_or_inject() {
+    let f = Fixture::new();
+    f.target("claude");
+    f.target("codex");
+    let mut req = f.request(false);
+    let launch = Launch::prepare(&mut req, None).unwrap().unwrap();
+    assert!(!launch.fresh);
+    assert!(launch.handoff.is_none());
+    assert_eq!(req.session_id.as_deref(), Some("old-session"));
+}
+
+#[test]
+fn failed_start_preserves_applied_metadata_and_latest_target() {
+    let f = Fixture::new();
+    f.target("claude");
+    let before = fs::read(f.cwd.join("agent.yaml")).unwrap();
+    let mut req = f.request(false);
+    {
+        let launch = Launch::prepare(&mut req, None).unwrap().unwrap();
+        assert!(launch.handoff.is_some());
+    }
+    assert_eq!(fs::read(f.cwd.join("agent.yaml")).unwrap(), before);
+    let mut retry = f.request(false);
+    assert!(Launch::prepare(&mut retry, None).unwrap().is_some());
+    assert_eq!(retry.cli, AgentCli::Claude);
+}
+
+#[test]
+fn first_start_is_not_a_fictional_provider_handoff() {
+    let f = Fixture::new();
+    fs::write(
+        f.cwd.join("agent.yaml"),
+        "id: agent-fixture73\nstatus: active\n",
+    )
+    .unwrap();
+    f.target("claude");
+    let mut req = f.request(false);
+    let launch = Launch::prepare(&mut req, None).unwrap().unwrap();
+    assert!(launch.handoff.is_none());
+    assert_eq!(req.cli, AgentCli::Claude);
+}
+
+#[test]
+fn aliases_are_equal_but_conflicting_applied_markers_fail_closed() {
+    let yaml = serde_yaml::from_str("provider: claude\nshell: cc\n").unwrap();
+    assert_eq!(effective_provider(&yaml).unwrap(), Some(AgentCli::Claude));
+    let yaml = serde_yaml::from_str("provider: codex\nshell: cc\n").unwrap();
+    assert!(effective_provider(&yaml).is_err());
+}
+
+#[test]
+fn legacy_baseline_uses_configuration_before_save() {
+    let mut yaml =
+        serde_yaml::from_str("id: agent-fixture73\nsession-source: native\nsession-id: old\n")
+            .unwrap();
+    let previous = ShellYaml {
+        provider: Some("claude".into()),
+        ..Default::default()
+    };
+    preserve_legacy_provider(Path::new("/nonexistent"), &mut yaml, &previous, None).unwrap();
+    assert_eq!(effective_provider(&yaml).unwrap(), Some(AgentCli::Claude));
+    let next = ShellYaml {
+        provider: Some("codex".into()),
+        ..Default::default()
+    };
+    preserve_legacy_provider(Path::new("/nonexistent"), &mut yaml, &next, None).unwrap();
+    assert_eq!(effective_provider(&yaml).unwrap(), Some(AgentCli::Claude));
+}
+
+#[test]
+fn pending_survives_resume_excluded_channels_and_only_matching_success_clears() {
+    let f = Fixture::new();
+    f.target("claude");
+    let mut req = f.request(false);
+    let mut launch = Launch::prepare(&mut req, None).unwrap().unwrap();
+    launch.commit(None).unwrap();
+    drop(launch);
+    let pending: Handoff = yaml_value(&f.yaml(), "handoff-pending").unwrap();
+    let mut resumed = f.request(false);
+    let mut resumed = Launch::prepare(&mut resumed, None).unwrap().unwrap();
+    resumed.commit(None).unwrap();
+    drop(resumed);
+    let original = "\x1b[200~<KOTA_MESSAGE>original\nmessage</KOTA_MESSAGE>\x1b[201~".to_string();
+    assert_eq!(
+        compose(
+            &f.cwd,
+            AgentCli::Claude,
+            original.clone(),
+            PromptSource::bus("dream")
+        )
+        .unwrap()
+        .0,
+        original
+    );
+    let (injected, sent) = compose(
+        &f.cwd,
+        AgentCli::Claude,
+        original.clone(),
+        PromptSource::Bus,
+    )
+    .unwrap();
+    assert_eq!(injected.matches("\x1b[200~").count(), 1);
+    assert!(injected.ends_with(&original[6..]));
+    assert_eq!(sent.as_ref(), Some(&pending));
+    // Simulate a failed submit: no clearing takes place.
+    assert!(compose(
+        &f.cwd,
+        AgentCli::Claude,
+        original.clone(),
+        PromptSource::Composer
+    )
+    .unwrap()
+    .1
+    .is_some());
+    let mut newer = pending.clone();
+    newer.id = Uuid::new_v4().to_string();
+    newer.generation = Uuid::new_v4().to_string();
+    let mut yaml = f.yaml();
+    yaml_set_value(&mut yaml, "handoff-pending", &newer).unwrap();
+    write_yaml_mapping(&f.cwd.join("agent.yaml"), &yaml).unwrap();
+    submitted(&f.cwd, &pending).unwrap();
+    assert_eq!(
+        yaml_value::<Handoff>(&f.yaml(), "handoff-pending"),
+        Some(newer.clone())
+    );
+    submitted(&f.cwd, &newer).unwrap();
+    assert_eq!(
+        compose(
+            &f.cwd,
+            AgentCli::Claude,
+            original.clone(),
+            PromptSource::Composer
+        )
+        .unwrap()
+        .0,
+        original
+    );
+}
+
+#[test]
+fn explicit_same_provider_fresh_clears_pending_but_switch_fresh_keeps_new_pending() {
+    let f = Fixture::new();
+    f.target("claude");
+    let mut req = f.request(true);
+    let mut launch = Launch::prepare(&mut req, None).unwrap().unwrap();
+    launch.commit(None).unwrap();
+    drop(launch);
+    assert!(yaml_value::<Handoff>(&f.yaml(), "handoff-pending").is_some());
+    let mut req = f.request(true);
+    let mut fresh = Launch::prepare(&mut req, None).unwrap().unwrap();
+    fresh.commit(None).unwrap();
+    assert!(yaml_value::<Handoff>(&f.yaml(), "handoff-pending").is_none());
+}
+
+#[test]
+fn inline_prompt_uses_target_paths_and_strict_split_preserves_original_bytes() {
+    let f = Fixture::new();
+    let id = Uuid::new_v4().to_string();
+    let make = || {
+        handoff_text(
+            &id,
+            "agent-fixture73",
+            "Fixture Agent",
+            "fixture-zenith-river-73",
+            "Zenith River 73",
+            &f.root.join("project-memory"),
+            AgentCli::Codex,
+            AgentCli::Claude,
+            "2026-09-20T12:34:56Z",
+        )
+    };
+    let prefix = make();
+    assert!(!prefix.contains("Relevant summary:"));
+    assert!(prefix.contains(&f.root.display().to_string()));
+    let input = "<KOTA_MESSAGE id=\"abc\">\n你好\n</KOTA_MESSAGE>\n";
+    let full = format!("{prefix}{input}");
+    let (handoff, original) = split_inline(&full, "agent-fixture73").unwrap();
+    assert_eq!(original, input);
+    assert_eq!(handoff.id, id);
+    assert!(split_inline(&format!("Quoted:\n{full}"), "agent-fixture73").is_none());
+    assert!(split_inline(&full, "agent-other").is_none());
+    assert!(split_inline(
+        &full.replace("The switch happened at:", "Date:"),
+        "agent-fixture73"
+    )
+    .is_none());
+    fs::create_dir_all(f.root.join("project-memory/chathistory/summaries")).unwrap();
+    fs::write(
+        f.root
+            .join("project-memory/chathistory/summaries/recent.json"),
+        "{}",
+    )
+    .unwrap();
+    assert!(split_inline(&format!("{}{input}", make()), "agent-fixture73").is_some());
+}
+
+#[test]
+fn six_default_shells_do_not_send_default_or_invent_effort() {
+    for cli in [
+        AgentCli::Claude,
+        AgentCli::Codex,
+        AgentCli::Antigravity,
+        AgentCli::Opencode,
+        AgentCli::Pi,
+        AgentCli::Kimi,
+    ] {
+        let f = Fixture::new();
+        let mut yaml = f.yaml();
+        set_provider(
+            &mut yaml,
+            if cli == AgentCli::Codex {
+                AgentCli::Claude
+            } else {
+                AgentCli::Codex
+            },
+        );
+        write_yaml_mapping(&f.cwd.join("agent.yaml"), &yaml).unwrap();
+        f.target(shell_name_for_cli(cli));
+        let mut request = f.request(false);
+        let launch = Launch::prepare(&mut request, None).unwrap().unwrap();
+        assert!(launch.fresh && launch.handoff.is_some());
+        assert_eq!(request.cli, cli);
+        let args = crate::pty::agent::args_for_spawn(
+            cli,
+            &request.args,
+            Path::new(&request.cwd),
+            request.session_id.as_deref(),
+        );
+        assert!(
+            !args.iter().any(|a| a == "default"
+                || a == "--model"
+                || a == "--effort"
+                || a == "--thinking"
+                || a.contains("reasoning_effort")
+                || a == "old-session"
+                || a == "--resume"
+                || a == "resume"),
+            "{cli:?}: {args:?}"
+        );
+    }
+}

@@ -268,7 +268,6 @@ const TAVERN_PREPARE_LABELS: Record<TavernPrepareTask, string> = {
 const TAVERN_PREPARE_TIMEOUT_MS = 5000;
 const OPENCODE_LEGACY_KIMI_MODEL = 'kimi-k2.6';
 const OPENCODE_KIMI_MODEL = 'kimi-for-coding/k2p6';
-const PI_DEFAULT_MODEL = 'zai/glm-5.2';
 export const TAVERN_PROFILE_CHANGED_EVENT = 'kota-v2:tavern-profile-changed';
 export const TAVERN_HERO_CREDIT_CHANGED_EVENT = 'kota-v2:tavern-hero-credit-changed';
 const DEFAULT_ACCOUNT_USER_IDENTITY: AccountUserIdentity = { name: 'User', avatarId: 'user-default' };
@@ -278,6 +277,7 @@ export interface TavernHeroIncarnationProfile {
   kind: AgentCardKind;
   cli: AgentCli;
   name: string;
+  nameFields: ProjectAgentNameFields;
   provider: ProviderId;
   model: string;
   effort?: string;
@@ -479,7 +479,6 @@ const PROVIDERS: Record<ProviderId, ProviderSpec> = {
     icon: providerIconClaude,
     installUrl: 'https://docs.anthropic.com/en/docs/claude-code/setup',
     defaultModel: 'default',
-    defaultEffort: 'max',
     defaultAvatarId: 'claude',
   },
   codex: {
@@ -489,7 +488,6 @@ const PROVIDERS: Record<ProviderId, ProviderSpec> = {
     icon: providerIconCodex,
     installUrl: 'https://github.com/openai/codex',
     defaultModel: 'default',
-    defaultEffort: 'xhigh',
     defaultAvatarId: 'codex',
   },
   antigravity: {
@@ -508,7 +506,7 @@ const PROVIDERS: Record<ProviderId, ProviderSpec> = {
     cli: 'opencode',
     icon: providerIconOpencode,
     installUrl: 'https://opencode.ai/docs',
-    defaultModel: 'opencode/deepseek-v4-flash-free',
+    defaultModel: 'default',
     defaultAvatarId: 'opencode',
     beta: true,
   },
@@ -518,8 +516,7 @@ const PROVIDERS: Record<ProviderId, ProviderSpec> = {
     cli: 'pi',
     icon: providerIconPi,
     installUrl: 'https://pi.dev',
-    defaultModel: PI_DEFAULT_MODEL,
-    defaultEffort: 'xhigh',
+    defaultModel: 'default',
     defaultAvatarId: 'pi',
     beta: true,
   },
@@ -546,10 +543,6 @@ const HERO_TEMPLATES: AgentCardSpec[] = [
   { id: 'hero-kimi', kind: 'custom', provider: 'kimi', name: 'Kimi' },
 ];
 const DEFAULT_HERO_TEMPLATE_IDS = new Set(HERO_TEMPLATES.map((hero) => hero.id));
-const FACTORY_DEFAULT_MODEL_MIGRATIONS: Record<string, { provider: ProviderId; model: string }> = {
-  'hero-cc': { provider: 'claude', model: 'claude-opus-4-8[1m]' },
-  'hero-dex': { provider: 'codex', model: 'gpt-5.5' },
-};
 const LEGACY_FACTORY_TEMPLATE_IDS = new Set(['alice', 'bob', 'charlie', 'david', 'claude', 'codex']);
 
 const TAVERN_ROMAN_SUFFIXES: Record<number, string> = {
@@ -798,6 +791,8 @@ export function TavernModal({
   const [deleteSkillTarget, setDeleteSkillTarget] = useState<AccountSkillDraft | null>(null);
   const [promptResetTarget, setPromptResetTarget] = useState<SystemHeroSpec | null>(null);
   const [promptResetBusy, setPromptResetBusy] = useState(false);
+  const [resetHeroesOpen, setResetHeroesOpen] = useState(false);
+  const [resetHeroesBusy, setResetHeroesBusy] = useState(false);
   const [systemOpen, setSystemOpen] = useState(false);
   const [ghostExpanded, setGhostExpanded] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
@@ -810,6 +805,10 @@ export function TavernModal({
   const [heroFilesReady, setHeroFilesReady] = useState(false);
   const [storageAgeNow, setStorageAgeNow] = useState(() => Date.now());
   const saveProfilesTimerRef = useRef<number | null>(null);
+  const saveProfilesTailRef = useRef<Promise<void>>(Promise.resolve());
+  const resetHeroesBusyRef = useRef(false);
+  const resetHeroesButtonRef = useRef<HTMLButtonElement | null>(null);
+  const resetHeroesCancelRef = useRef<HTMLButtonElement | null>(null);
   const lastSavedProfilesPayloadRef = useRef<string | null>(null);
   const profilePersistenceHeroesRef = useRef<AgentCardSpec[]>([...HERO_TEMPLATES, ...customHeroes]);
   const saveRuleTimerRef = useRef<number | null>(null);
@@ -843,6 +842,87 @@ export function TavernModal({
   useEffect(() => {
     profilePersistenceHeroesRef.current = [...HERO_TEMPLATES, ...customHeroes];
   }, [customHeroes]);
+
+  // Normal saves and explicit Reset share one order: an older save must never
+  // finish after Reset and restore the previous templates.
+  const persistHeroProfiles = useCallback((next: TavernHeroProfileDraft[]) => {
+    const task = saveProfilesTailRef.current.catch(() => undefined)
+      .then(() => saveTavernHeroProfiles(next));
+    saveProfilesTailRef.current = task;
+    return task;
+  }, []);
+
+  const applyHeroProfiles = useCallback((saved: TavernHeroProfileDraft[]) => {
+    syncTavernHeroStorageFromProfiles(saved);
+    if (!mountedRef.current) return;
+    const next = tavernStateFromProfiles(saved);
+    lastSavedProfilesPayloadRef.current = serializeTavernProfilesForPersistence(
+      [...HERO_TEMPLATES, ...next.customHeroes], next.profiles,
+    );
+    setCustomHeroes(next.customHeroes);
+    setProfiles(next.profiles);
+    setHeroFilesReady(true);
+  }, []);
+
+  useEffect(() => {
+    if (!resetHeroesOpen) return;
+    resetHeroesCancelRef.current?.focus();
+    return () => resetHeroesButtonRef.current?.focus();
+  }, [resetHeroesOpen]);
+
+  const confirmResetHeroes = async () => {
+    if (resetHeroesBusyRef.current || !heroFilesReady) return;
+    resetHeroesBusyRef.current = true;
+    setResetHeroesBusy(true);
+    setError(null);
+    const pending = saveProfilesTimerRef.current == null ? null
+      : tavernProfilesForPersistence([...HERO_TEMPLATES, ...customHeroes], profiles);
+    if (saveProfilesTimerRef.current != null) {
+      window.clearTimeout(saveProfilesTimerRef.current);
+      saveProfilesTimerRef.current = null;
+    }
+    let saved = false;
+    let attemptedWrite = false;
+    try {
+      if (pending) {
+        // Preserve an added/edited custom card still waiting for its debounce.
+        attemptedWrite = true;
+        await persistHeroProfiles(pending);
+      }
+      await saveProfilesTailRef.current.catch(() => undefined);
+      const current = hasTauriRuntime()
+        ? await loadTavernHeroProfiles()
+        : tavernProfilesForPersistence([...HERO_TEMPLATES, ...customHeroes], profiles);
+      const next = resetTavernHeroProfiles(current);
+      attemptedWrite = true;
+      await persistHeroProfiles(next);
+      saved = true;
+      applyHeroProfiles(hasTauriRuntime() ? await loadTavernHeroProfiles() : next);
+      if (mountedRef.current) {
+        setError(null);
+        setSelectedHeroId(HERO_TEMPLATES[0].id);
+        setProfileTarget(null);
+      }
+    } catch (err) {
+      // The existing saver is best-effort, not a transaction. On a partial
+      // failure project the actual files; never autosave stale UI back over them.
+      if (attemptedWrite && !saved) {
+        try { applyHeroProfiles(await loadTavernHeroProfiles()); }
+        catch { if (mountedRef.current) setHeroFilesReady(false); }
+      } else if (mountedRef.current) {
+        setHeroFilesReady(false);
+      }
+      if (mountedRef.current) setError(saved
+        ? `Heroes were saved, but could not refresh the cards. Reopen Tavern. ${String(err)}`
+        : `Could not reset all Heroes. ${String(err)}`);
+    } finally {
+      resetHeroesBusyRef.current = false;
+      if (mountedRef.current) {
+        setResetHeroesBusy(false);
+        setResetHeroesOpen(false);
+      }
+    }
+  };
 
   const refreshAccount = useCallback(async () => {
     const status = await loadTavernAccountStatus();
@@ -937,12 +1017,10 @@ export function TavernModal({
       const synced = tavernStateFromProfiles(savedProfiles);
       setCustomHeroes(synced.customHeroes);
       setProfiles(synced.profiles);
-      lastSavedProfilesPayloadRef.current = synced.migratedFactoryDefaults
-        ? null
-        : serializeTavernProfilesForPersistence(
-          [...HERO_TEMPLATES, ...synced.customHeroes],
-          synced.profiles,
-        );
+      lastSavedProfilesPayloadRef.current = serializeTavernProfilesForPersistence(
+        [...HERO_TEMPLATES, ...synced.customHeroes],
+        synced.profiles,
+      );
       setHeroFilesReady(true);
     };
     const prepared = consumePreparedTavernOpenState();
@@ -1049,7 +1127,9 @@ export function TavernModal({
       if (event.key !== 'Escape') return;
       event.preventDefault();
       event.stopPropagation();
-      if (skillImportDialog) {
+      if (resetHeroesOpen) {
+        if (!resetHeroesBusyRef.current) setResetHeroesOpen(false);
+      } else if (skillImportDialog) {
         setSkillImportDialog(null);
       } else if (promptResetTarget) {
         setPromptResetTarget(null);
@@ -1067,13 +1147,15 @@ export function TavernModal({
     };
     document.addEventListener('keydown', onKeyDown, true);
     return () => document.removeEventListener('keydown', onKeyDown, true);
-  }, [deleteRuleTarget, deleteSkillTarget, onClose, open, profileTarget, promptResetTarget, skillImportDialog]);
+  }, [deleteRuleTarget, deleteSkillTarget, onClose, open, profileTarget, promptResetTarget, resetHeroesOpen, skillImportDialog]);
 
   useEffect(() => {
     if (!open) return;
     const refreshHeroRecords = () => {
+      if (resetHeroesBusyRef.current) return;
       void loadTavernHeroProfiles()
         .then((savedProfiles) => {
+          if (resetHeroesBusyRef.current) return;
           setProfiles((prev) => {
             const next = { ...prev };
             for (const profile of savedProfiles) {
@@ -1105,7 +1187,7 @@ export function TavernModal({
   }, [profiles]);
 
   useEffect(() => {
-    if (!heroFilesReady) return;
+    if (!heroFilesReady || resetHeroesBusyRef.current) return;
     const nextProfiles = tavernProfilesForPersistence([...HERO_TEMPLATES, ...customHeroes], profiles);
     const nextPayload = JSON.stringify(nextProfiles);
     if (nextPayload === lastSavedProfilesPayloadRef.current) return;
@@ -1114,7 +1196,8 @@ export function TavernModal({
     }
     saveProfilesTimerRef.current = window.setTimeout(() => {
       saveProfilesTimerRef.current = null;
-      void saveTavernHeroProfiles(nextProfiles)
+      if (resetHeroesBusyRef.current) return;
+      void persistHeroProfiles(nextProfiles)
         .then(() => {
           lastSavedProfilesPayloadRef.current = nextPayload;
         })
@@ -1128,7 +1211,7 @@ export function TavernModal({
         saveProfilesTimerRef.current = null;
       }
     };
-  }, [customHeroes, heroFilesReady, profiles]);
+  }, [customHeroes, heroFilesReady, persistHeroProfiles, profiles, resetHeroesBusy]);
 
   useEffect(() => {
     try {
@@ -1400,7 +1483,7 @@ export function TavernModal({
       if (
         patch.provider != null ||
         patch.model != null ||
-        patch.effort != null ||
+        'effort' in patch ||
         patch.skills != null
       ) {
         next.shell = buildShellYaml(next);
@@ -1859,6 +1942,17 @@ export function TavernModal({
               </button>
             </div>
 
+            <div className="tavern-reset-heroes">
+              <button
+                ref={resetHeroesButtonRef}
+                type="button"
+                disabled={!heroFilesReady || resetHeroesBusy}
+                onClick={() => setResetHeroesOpen(true)}
+              >
+                Reset All Heroes
+              </button>
+            </div>
+
             <SupportedProviders
               shells={shells}
               shellsLoading={!!loadingTasks.shells}
@@ -2268,6 +2362,40 @@ export function TavernModal({
         </div>
       )}
 
+      {resetHeroesOpen && (
+        <div
+          className="kota-confirm-layer"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Reset All Heroes?"
+          aria-describedby="tavern-reset-heroes-copy"
+          aria-busy={resetHeroesBusy}
+          onKeyDown={(event) => {
+            if (event.key !== 'Tab') return;
+            const buttons = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('button:not(:disabled)'));
+            if (buttons.length === 0) { event.preventDefault(); return; }
+            if (event.shiftKey && document.activeElement === buttons[0]) {
+              event.preventDefault(); buttons.at(-1)?.focus();
+            } else if (!event.shiftKey && document.activeElement === buttons.at(-1)) {
+              event.preventDefault(); buttons[0]?.focus();
+            }
+          }}
+        >
+          <div className="kota-confirm-card danger">
+            <h2>Reset All Heroes?</h2>
+            <pre id="tavern-reset-heroes-copy">Reset ALL Hero cards to factory defaults. This CAN'T be undone.</pre>
+            <div className="kota-confirm-actions">
+              <button ref={resetHeroesCancelRef} type="button" disabled={resetHeroesBusy} onClick={() => setResetHeroesOpen(false)}>
+                Cancel
+              </button>
+              <button type="button" className="confirm" disabled={resetHeroesBusy} onClick={() => void confirmResetHeroes()}>
+                {resetHeroesBusy ? 'Resetting…' : 'Reset All Heroes'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {promptResetTarget && (
         <div className="kota-confirm-layer" role="dialog" aria-modal="true" aria-label="Reset prompt files">
           <div className="kota-confirm-card danger">
@@ -2466,9 +2594,7 @@ function AgentProfileOverlay({
 }) {
   const draft = normalizeDraft(hero, profiles[hero.id]);
   const provider = PROVIDERS[draft.provider];
-  const shellStatus = shellById.get(provider.id);
-  const effortOptions = shellStatus?.effortOptions ?? [];
-  const selectedEffort = draft.effort ?? provider.defaultEffort ?? effortOptions[0]?.value ?? '';
+  const selectedEffort = draft.effort ?? '';
   // SHELL edits are staged locally and only committed on Save Shell, so the
   // 250ms profile autosave never persists a half-typed model id.
   const [shellEditing, setShellEditing] = useState(false);
@@ -2485,6 +2611,7 @@ function AgentProfileOverlay({
     : [{ id: editProviderSpec.defaultModel, label: editProviderSpec.defaultModel, source: 'default' }];
   const editEffortSeed = editShellStatus?.effortOptions ?? [];
   const modelComboOptions = uniqueShellComboOptions([
+    { id: 'default', label: 'CLI default', source: 'default' },
     ...editModelSeed.map((option) => ({
       id: option.id,
       label: option.label || option.id,
@@ -2580,10 +2707,7 @@ function AgentProfileOverlay({
     if (editProvider !== draft.provider) {
       onSelectProvider(hero, editProvider);
     }
-    const patch: Partial<HeroDraft> = { model: nextModel };
-    if (editEffortSeed.length > 0 || nextEffort) {
-      patch.effort = nextEffort || undefined;
-    }
+    const patch: Partial<HeroDraft> = { model: nextModel, effort: nextEffort || undefined };
     onUpdate(hero, patch);
     setProviderMenuOpen(false);
     setShellEditing(false);
@@ -3569,9 +3693,7 @@ function normalizeDraft(hero: AgentCardSpec, draft?: Partial<HeroDraft>): HeroDr
   const provider = providerIdFromStored(draft?.provider, hero.provider) ?? hero.provider;
   const providerSpec = PROVIDERS[provider];
   const draftName = draft?.name;
-  const storedModel = draft?.model ?? providerSpec.defaultModel;
-  const migratingFactoryDefault = isFactoryDefaultModelMigration(hero.id, provider, storedModel);
-  const model = normalizeDefaultModel(hero, provider, storedModel);
+  const model = normalizeModelIdForProvider(provider, draft?.model ?? providerSpec.defaultModel);
   const avatarId = normalizeHeroAvatarId(draft?.avatarId, provider);
   const merged: HeroDraft = {
     name: isLegacyTemplateName(hero, draftName) ? hero.name : draftName ?? hero.name,
@@ -3582,7 +3704,7 @@ function normalizeDraft(hero: AgentCardSpec, draft?: Partial<HeroDraft>): HeroDr
     avatarId,
     skills: draft?.skills ?? DEFAULT_SKILLS,
     ghost: normalizeFactoryGhost(hero, providerSpec, draft?.ghost),
-    shell: migratingFactoryDefault ? '' : draft?.shell ?? '',
+    shell: draft?.shell ?? '',
     record: draft?.record ?? null,
     archived: draft?.archived ?? false,
     dismissed: draft?.dismissed ?? false,
@@ -3622,24 +3744,6 @@ function normalizePiModelId(model: string): string {
   if (trimmed.startsWith('glm-')) return `zai/${trimmed}`;
   if (trimmed.startsWith('kimi-') || trimmed.startsWith('k2p')) return `kimi-coding/${trimmed}`;
   return trimmed;
-}
-
-function normalizeDefaultModel(hero: AgentCardSpec, provider: ProviderId, model: string): string {
-  const normalized = normalizeModelIdForProvider(provider, model);
-  if (isFactoryDefaultModelMigration(hero.id, provider, normalized)) {
-    return 'default';
-  }
-  if (DEFAULT_HERO_TEMPLATE_IDS.has(hero.id) && provider === 'opencode' && normalized === 'openai/gpt-5.5') {
-    return PROVIDERS.opencode.defaultModel;
-  }
-  return normalized;
-}
-
-function isFactoryDefaultModelMigration(heroId: string, provider: ProviderId, model: string): boolean {
-  const migration = FACTORY_DEFAULT_MODEL_MIGRATIONS[heroId];
-  return !!migration
-    && migration.provider === provider
-    && migration.model === normalizeModelIdForProvider(provider, model);
 }
 
 function defaultGhost(hero: AgentCardSpec, provider: ProviderSpec): string {
@@ -3776,6 +3880,30 @@ function tavernProfilesForPersistence(
   });
 }
 
+function resetTavernHeroProfiles(saved: TavernHeroProfileDraft[]): TavernHeroProfileDraft[] {
+  // This is the fresh-install path, not a second set of factory defaults.
+  const factory = tavernProfilesForPersistence(HERO_TEMPLATES, {});
+  const factoryNames = new Set(factory.map((hero) => tavernHeroNameKey(hero.name)));
+  const others = saved.filter((hero) => !DEFAULT_HERO_TEMPLATE_IDS.has(hero.heroId));
+  const usedNames = new Set([
+    ...factoryNames,
+    ...others.filter((hero) => !hero.dismissed).map((hero) => tavernHeroNameKey(hero.name)),
+  ]);
+  return [
+    ...factory,
+    ...others.map((hero) => {
+      if (hero.dismissed) return hero;
+      let name = hero.name;
+      if (factoryNames.has(tavernHeroNameKey(name))) {
+        do { name += '(1)'; } while (usedNames.has(tavernHeroNameKey(name)));
+        usedNames.add(tavernHeroNameKey(name));
+      }
+      return { ...hero, archived: true, name,
+        nameFields: name === hero.name ? hero.nameFields : projectAgentNameFields(name) };
+    }),
+  ];
+}
+
 function serializeTavernProfilesForPersistence(
   heroes: AgentCardSpec[],
   profiles: Record<string, Partial<HeroDraft>>,
@@ -3786,14 +3914,15 @@ function serializeTavernProfilesForPersistence(
 function launchArgs(draft: HeroDraft): string[] {
   const model = normalizeModelIdForProvider(draft.provider, draft.model);
   const modelArgs = model === 'default' ? [] : ['--model', model];
+  const effort = draft.effort?.trim();
+  const effortArgs = effort && effort !== 'default' ? [effort] : [];
   switch (draft.provider) {
     case 'claude':
-      return [...modelArgs, '--effort', draft.effort ?? 'max', '--dangerously-skip-permissions'];
+      return [...modelArgs, ...(effortArgs.length ? ['--effort', ...effortArgs] : []), '--dangerously-skip-permissions'];
     case 'codex':
       return [
         ...modelArgs,
-        '--config',
-        `model_reasoning_effort="${draft.effort ?? 'xhigh'}"`,
+        ...(effortArgs.length ? ['--config', `model_reasoning_effort="${effort}"`] : []),
         '--dangerously-bypass-approvals-and-sandbox',
       ];
     case 'antigravity':
@@ -3801,7 +3930,7 @@ function launchArgs(draft: HeroDraft): string[] {
     case 'opencode':
       return [...modelArgs, '--pure', '--dangerously-skip-permissions'];
     case 'pi':
-      return [...modelArgs, '--thinking', draft.effort ?? 'xhigh', '--approve'];
+      return [...modelArgs, ...(effortArgs.length ? ['--thinking', ...effortArgs] : []), '--approve'];
     case 'kimi':
       return [...modelArgs, '--yolo'];
   }
@@ -3874,17 +4003,11 @@ function loadProfileDrafts(): Record<string, Partial<HeroDraft>> {
 function tavernStateFromProfiles(savedProfiles: TavernHeroProfileDraft[]): {
   customHeroes: AgentCardSpec[];
   profiles: Record<string, Partial<HeroDraft>>;
-  migratedFactoryDefaults: boolean;
 } {
   const builtInIds = new Set(HERO_TEMPLATES.map((hero) => hero.id));
   const profiles: Record<string, Partial<HeroDraft>> = {};
   const customHeroes: AgentCardSpec[] = [];
-  let migratedFactoryDefaults = false;
   for (const profile of savedProfiles) {
-    const provider = providerIdFromStored(profile.provider);
-    if (provider && isFactoryDefaultModelMigration(profile.heroId, provider, profile.model)) {
-      migratedFactoryDefaults = true;
-    }
     profiles[profile.heroId] = tavernProfileToDraft(profile);
     if (builtInIds.has(profile.heroId)) continue;
     if (LEGACY_FACTORY_TEMPLATE_IDS.has(profile.heroId)) continue;
@@ -3895,7 +4018,7 @@ function tavernStateFromProfiles(savedProfiles: TavernHeroProfileDraft[]): {
       name: profile.name || 'New Hero',
     });
   }
-  return { customHeroes, profiles, migratedFactoryDefaults };
+  return { customHeroes, profiles };
 }
 
 export function syncTavernHeroStorageFromProfiles(savedProfiles: TavernHeroProfileDraft[]): void {
@@ -3986,6 +4109,7 @@ export function loadTavernHeroIncarnationProfile(
     kind: hero.kind,
     cli: providerCli(draft.provider),
     name: draft.name,
+    nameFields: heroNameFields(draft),
     provider: draft.provider,
     model: draft.model,
     effort: draft.effort,

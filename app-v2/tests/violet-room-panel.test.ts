@@ -311,3 +311,15 @@ function localComposerMessage(
     targetAgentIds: overrides.targetAgentIds,
   };
 }
+
+
+it('uses the explicit shell handoff origin for a whisper without turning the original input into one', () => {
+  const base = { sessionId: 'new', agentId: 'agent-a', shell: 'claude', kind: 'message', timestamp: '2026-09-20T12:00:00Z' };
+  const native: VioletChatMessage[] = [
+    { ...base, id: 'handoff-id', role: 'system', text: 'Read project memory.', messageOrigin: 'shell_handoff' },
+    { ...base, id: 'original-id', role: 'user', text: 'Continue the task.' },
+  ];
+  const merged = mergeRoomMessages(native, []);
+  expect(merged.find((m) => m.id === 'handoff-id')).toMatchObject({ ghostSasayaki: true, text: 'Read project memory.' });
+  expect(merged.find((m) => m.id === 'original-id')?.ghostSasayaki).toBeUndefined();
+});

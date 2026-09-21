@@ -111,6 +111,7 @@ export interface AgentSpawnRequest {
   projectBaseRef?: string;
   /** Confirmed user intent to end a foreign live session and resume here. */
   takeover?: boolean;
+  freshSession?: boolean;
 }
 
 export interface AgentRoute {

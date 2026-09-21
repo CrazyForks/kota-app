@@ -3411,7 +3411,7 @@ function markGhostSasayakiMessages(
     .sort((a, b) => a.time - b.time || a.message.id.localeCompare(b.message.id));
 
   const markedInternalEchoes = nativeMessages.map((message) => (
-    isNativeInternalAgentBusEnvelopeEcho(message) || isNativeTemporalGapEcho(message)
+    message.messageOrigin === 'shell_handoff' || isNativeInternalAgentBusEnvelopeEcho(message) || isNativeTemporalGapEcho(message)
       ? { ...message, ghostSasayaki: true }
       : message
   ));

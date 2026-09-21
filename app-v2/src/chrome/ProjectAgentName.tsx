@@ -31,6 +31,21 @@ export function nameWithProjectSurname(name: string, projectName?: string | null
   });
 }
 
+export function incarnationNameFields(
+  name: string,
+  saved: ProjectAgentNameFields | null | undefined,
+  suffix: string,
+  projectName?: string | null,
+): ProjectAgentNameFields {
+  const fields = saved ?? projectAgentNameFields(name);
+  const project = projectSurnameLabel(projectName);
+  return {
+    ...fields,
+    given: `${fields.given || name.trim() || 'Agent'}${suffix}`,
+    surname: project ? `v. ${project}` : '',
+  };
+}
+
 export function projectSurnameLabel(projectName?: string | null): string {
   const project = safeText(projectName).trim();
   if (!project) return '';

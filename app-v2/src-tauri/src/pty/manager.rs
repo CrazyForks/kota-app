@@ -132,13 +132,42 @@ impl PtyManager {
         self.agents.write(app, &agent_id, input)
     }
 
+    pub(crate) fn agent_try_write_running(
+        &self,
+        app: &AppHandle,
+        agent_id: &str,
+        input: String,
+    ) -> Result<Option<String>> {
+        self.agents.try_write_running(app, agent_id, input)
+    }
+
     pub fn agent_submit_prompt(
         &self,
         app: &AppHandle,
         agent_id: String,
         input: String,
     ) -> Result<()> {
-        self.agents.submit_prompt(app, &agent_id, input)
+        self.agents.submit_prompt(
+            app,
+            &agent_id,
+            input,
+            crate::shell_switch::PromptSource::Composer,
+        )
+    }
+
+    pub(crate) fn agent_submit_bus_prompt(
+        &self,
+        app: &AppHandle,
+        agent_id: &str,
+        input: String,
+        intent: &str,
+    ) -> Result<()> {
+        self.agents.submit_prompt(
+            app,
+            agent_id,
+            input,
+            crate::shell_switch::PromptSource::bus(intent),
+        )
     }
 
     pub fn agent_resize(&self, agent_id: String, cols: u16, rows: u16) -> Result<()> {

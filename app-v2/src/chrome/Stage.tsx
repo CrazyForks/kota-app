@@ -190,7 +190,7 @@ function SeatCard({
           : `Open ${agent.name}'s terminal`}
       title={unsupported
         ? `${agent.name} · Unsupported provider: ${unsupportedProvider}`
-        : `${agent.name} · ${agent.role}`}
+        : agent.name}
       data-pill={pill ? 'true' : 'false'}
       data-working={working ? 'true' : 'false'}
       data-dreaming={dreaming ? 'true' : 'false'}

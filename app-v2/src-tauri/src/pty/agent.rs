@@ -20,7 +20,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -52,8 +52,6 @@ const AGENT_PROMPT_MAX_SETTLE_WAIT: Duration = Duration::from_millis(1500);
 const AGENT_PROMPT_SUBMIT_CONFIRM_WAIT: Duration = Duration::from_millis(1500);
 const AGENT_PROMPT_NATIVE_CONFIRM_POLL: Duration = Duration::from_millis(50);
 const AGENT_SESSION_LEASE_ERROR_PREFIX: &str = "KOTA_AGENT_SESSION_LEASE_CONFLICT:";
-static OPENCODE_LAUNCH_MODE_CACHE: OnceLock<Mutex<HashMap<String, OpencodeLaunchMode>>> =
-    OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -67,19 +65,10 @@ pub enum AgentCli {
     Kimi,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OpencodeLaunchMode {
-    RunInteractive,
-    Mini {
-        supports_dangerously_skip_permissions: bool,
-        supports_session: bool,
-    },
-}
-
 impl AgentCli {
     /// Bin name resolved on PATH. CLI flag args (if any) come from agent.yaml later;
     /// dogfood-min spawns the bin bare and lets the user / persona drive the prompt.
-    fn bin(self) -> &'static str {
+    pub(crate) fn bin(self) -> &'static str {
         match self {
             AgentCli::Claude => "claude",
             AgentCli::Codex => "codex",
@@ -92,36 +81,23 @@ impl AgentCli {
 }
 
 #[cfg(test)]
-fn args_for_spawn(
+pub(crate) fn args_for_spawn(
     cli: AgentCli,
     args: &[String],
     cwd: &Path,
     session_id: Option<&str>,
 ) -> Vec<String> {
-    args_for_spawn_with_opencode_launch_mode(
-        cli,
-        args,
-        cwd,
-        session_id,
-        OpencodeLaunchMode::RunInteractive,
-    )
+    build_spawn_args(cli, args, cwd, session_id)
 }
 
-fn args_for_spawn_with_opencode_launch_mode(
+fn build_spawn_args(
     cli: AgentCli,
     args: &[String],
     cwd: &Path,
     session_id: Option<&str>,
-    opencode_launch_mode: OpencodeLaunchMode,
 ) -> Vec<String> {
     let mut out = normalize_runtime_args(cli, args);
-    let opencode_launch_mode =
-        if cli == AgentCli::Opencode && opencode_args_request_subcommand(&out) {
-            OpencodeLaunchMode::RunInteractive
-        } else {
-            opencode_launch_mode
-        };
-    ensure_default_runtime_args(cli, &mut out, opencode_launch_mode);
+    ensure_default_runtime_args(cli, &mut out);
     if let Some(session_id) = session_id.filter(|session_id| !session_id.trim().is_empty()) {
         match cli {
             AgentCli::Claude => {
@@ -162,29 +138,14 @@ fn args_for_spawn_with_opencode_launch_mode(
         out.splice(0..0, ["--add-dir".to_string(), cwd.display().to_string()]);
     }
     let mut opencode_mini_project = None;
-    if cli == AgentCli::Opencode {
-        match opencode_launch_mode {
-            OpencodeLaunchMode::RunInteractive => {
-                if !opencode_args_have_dir(&out) {
-                    out.extend(["--dir".to_string(), cwd.display().to_string()]);
-                }
-            }
-            OpencodeLaunchMode::Mini {
-                supports_dangerously_skip_permissions,
-                supports_session,
-            } => {
-                opencode_mini_project =
-                    take_opencode_dir_arg(&mut out).or_else(|| Some(cwd.display().to_string()));
-                if !supports_dangerously_skip_permissions {
-                    strip_opencode_dangerously_skip_permissions_arg(&mut out);
-                }
-                if !supports_session {
-                    strip_opencode_session_arg(&mut out);
-                }
-            }
-        }
+    if cli == AgentCli::Opencode && !opencode_args_request_subcommand(&out) {
+        opencode_mini_project =
+            take_opencode_dir_arg(&mut out).or_else(|| Some(cwd.display().to_string()));
+        // Kota supplies mini's permission policy through OPENCODE_CONFIG_CONTENT;
+        // do not forward the old permission flag from existing SHELL defaults.
+        strip_opencode_dangerously_skip_permissions_arg(&mut out);
     }
-    normalize_spawn_subcommand_args(cli, &mut out, opencode_launch_mode, opencode_mini_project);
+    normalize_spawn_subcommand_args(cli, &mut out, opencode_mini_project);
     out
 }
 
@@ -207,11 +168,7 @@ fn normalize_runtime_args(cli: AgentCli, args: &[String]) -> Vec<String> {
     out
 }
 
-fn ensure_default_runtime_args(
-    cli: AgentCli,
-    args: &mut Vec<String>,
-    opencode_launch_mode: OpencodeLaunchMode,
-) {
+fn ensure_default_runtime_args(cli: AgentCli, args: &mut Vec<String>) {
     match cli {
         AgentCli::Claude => {
             if !has_any_arg(
@@ -247,20 +204,6 @@ fn ensure_default_runtime_args(
             if !args.iter().any(|arg| arg == "--pure") {
                 args.push("--pure".into());
             }
-            let supports_dangerously_skip_permissions = match opencode_launch_mode {
-                OpencodeLaunchMode::RunInteractive => true,
-                OpencodeLaunchMode::Mini {
-                    supports_dangerously_skip_permissions,
-                    ..
-                } => supports_dangerously_skip_permissions,
-            };
-            if supports_dangerously_skip_permissions
-                && !args
-                    .iter()
-                    .any(|arg| arg == "--dangerously-skip-permissions")
-            {
-                args.push("--dangerously-skip-permissions".into());
-            }
         }
         AgentCli::Pi => {
             if !has_any_arg(args, &["--approve", "-a", "--no-approve", "-na"], &[]) {
@@ -278,7 +221,6 @@ fn ensure_default_runtime_args(
 fn normalize_spawn_subcommand_args(
     cli: AgentCli,
     args: &mut Vec<String>,
-    opencode_launch_mode: OpencodeLaunchMode,
     opencode_mini_project: Option<String>,
 ) {
     if cli != AgentCli::Opencode {
@@ -287,86 +229,10 @@ fn normalize_spawn_subcommand_args(
     if opencode_args_request_subcommand(args) {
         return;
     }
-    match opencode_launch_mode {
-        OpencodeLaunchMode::RunInteractive => {
-            args.splice(0..0, ["run".to_string(), "--interactive".to_string()]);
-        }
-        OpencodeLaunchMode::Mini { .. } => {
-            args.insert(0, "--mini".to_string());
-            if let Some(project) = opencode_mini_project {
-                args.push(project);
-            }
-        }
+    args.insert(0, "--mini".to_string());
+    if let Some(project) = opencode_mini_project {
+        args.push(project);
     }
-}
-
-fn resolve_opencode_launch_mode(cli: AgentCli, bin: &str) -> OpencodeLaunchMode {
-    if cli != AgentCli::Opencode {
-        return OpencodeLaunchMode::RunInteractive;
-    }
-    let cache = OPENCODE_LAUNCH_MODE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(mode) = cache
-        .lock()
-        .expect("opencode launch mode cache poisoned")
-        .get(bin)
-        .copied()
-    {
-        return mode;
-    }
-
-    let mode = probe_opencode_launch_mode(bin).unwrap_or(OpencodeLaunchMode::RunInteractive);
-    cache
-        .lock()
-        .expect("opencode launch mode cache poisoned")
-        .insert(bin.to_string(), mode);
-    mode
-}
-
-fn probe_opencode_launch_mode(bin: &str) -> Result<OpencodeLaunchMode> {
-    let run_help = opencode_help_text(bin, &["run", "--help"])?;
-    if opencode_run_help_supports_interactive(&run_help) {
-        return Ok(OpencodeLaunchMode::RunInteractive);
-    }
-    let mini_help = opencode_help_text(bin, &["--mini", "--help"]).unwrap_or_default();
-    let supports_dangerously_skip_permissions =
-        opencode_mini_help_supports_dangerously_skip_permissions(&mini_help);
-    let supports_session = opencode_mini_help_supports_session(&mini_help);
-    Ok(OpencodeLaunchMode::Mini {
-        supports_dangerously_skip_permissions,
-        supports_session,
-    })
-}
-
-fn opencode_help_text(bin: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(bin)
-        .args(args)
-        .env("NO_COLOR", "1")
-        .env_remove("FORCE_COLOR")
-        .output()
-        .with_context(|| format!("probe {bin} {}", args.join(" ")))?;
-    let mut text = String::new();
-    text.push_str(&String::from_utf8_lossy(&output.stdout));
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-    if output.status.success() || !text.trim().is_empty() {
-        return Ok(text);
-    }
-    Err(anyhow!(
-        "probe {bin} {} failed with status {}",
-        args.join(" "),
-        output.status
-    ))
-}
-
-fn opencode_run_help_supports_interactive(help: &str) -> bool {
-    help.contains("--interactive")
-}
-
-fn opencode_mini_help_supports_dangerously_skip_permissions(help: &str) -> bool {
-    help.contains("--dangerously-skip-permissions")
-}
-
-fn opencode_mini_help_supports_session(help: &str) -> bool {
-    help.contains("--session")
 }
 
 fn take_opencode_dir_arg(args: &mut Vec<String>) -> Option<String> {
@@ -398,25 +264,6 @@ fn take_opencode_dir_arg(args: &mut Vec<String>) -> Option<String> {
 
 fn strip_opencode_dangerously_skip_permissions_arg(args: &mut Vec<String>) {
     args.retain(|arg| arg != "--dangerously-skip-permissions");
-}
-
-fn strip_opencode_session_arg(args: &mut Vec<String>) {
-    let mut next = Vec::with_capacity(args.len());
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        if arg == "--session" || arg == "-s" {
-            i += if args.get(i + 1).is_some() { 2 } else { 1 };
-            continue;
-        }
-        if arg.starts_with("--session=") {
-            i += 1;
-            continue;
-        }
-        next.push(arg.clone());
-        i += 1;
-    }
-    *args = next;
 }
 
 fn has_any_arg(args: &[String], exact: &[&str], prefixes: &[&str]) -> bool {
@@ -935,9 +782,10 @@ fn kimi_session_state_matches_cwd(session_dir: &Path, cwd: &Path) -> bool {
         return false;
     };
     state
-        .get("workDir")
+        .get("cwd")
+        .or_else(|| state.get("workDir"))
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|work_dir| paths_refer_to_same_directory(Path::new(work_dir), cwd))
+        .is_some_and(|session_cwd| paths_refer_to_same_directory(Path::new(session_cwd), cwd))
 }
 
 fn paths_refer_to_same_directory(left: &Path, right: &Path) -> bool {
@@ -1032,11 +880,6 @@ fn opencode_args_request_session(args: &[String]) -> bool {
             || arg == "-s"
             || arg.starts_with("--session=")
     })
-}
-
-fn opencode_args_have_dir(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| arg == "--dir" || arg.starts_with("--dir="))
 }
 
 fn opencode_args_request_subcommand(args: &[String]) -> bool {
@@ -1151,6 +994,9 @@ pub struct AgentSpawnRequest {
     pub project_base_ref: Option<String>,
     #[serde(default)]
     pub takeover: bool,
+    /// Explicit Fresh intent survives fallback request resolution.
+    #[serde(default)]
+    pub fresh_session: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1329,6 +1175,16 @@ fn agent_session_lease_path(req: &AgentSpawnRequest) -> PathBuf {
         .join(".kota")
         .join("agent-session-leases")
         .join(format!("{}.json", safe_lease_filename(&req.agent_id)))
+}
+
+pub(crate) fn live_provider_for(root: &Path, agent: &str, cwd: &Path) -> Option<AgentCli> {
+    let path = crate::project_memory_dir(root).join(".kota/agent-session-leases")
+        .join(format!("{}.json", safe_lease_filename(agent)));
+    let lease = read_agent_session_lease(&path)?;
+    (lease.agent_id == agent
+        && cwd.canonicalize().ok().is_some_and(|cwd| Path::new(&lease.cwd).canonicalize().ok().as_ref() == Some(&cwd))
+        && lease.child_pid.is_some_and(process_is_alive))
+        .then_some(lease.cli)
 }
 
 fn safe_lease_filename(value: &str) -> String {
@@ -1828,7 +1684,7 @@ impl AgentTerminalPty {
         Ok(())
     }
 
-    pub fn submit_prompt(&self, app: &AppHandle, input: String) -> Result<()> {
+    pub(crate) fn submit_prompt(&self, app: &AppHandle, input: String, source: crate::shell_switch::PromptSource) -> Result<()> {
         let _submit_guard = self
             .inner
             .submit_lock
@@ -1847,6 +1703,9 @@ impl AgentTerminalPty {
                 self.inner.agent_id
             ));
         }
+        let metadata_cwd = self.inner.project_root.join(".agent-workspaces").join(&self.inner.agent_id);
+        let (input, handoff) = crate::shell_switch::compose(&metadata_cwd, self.inner.cli, input, source)
+            .map_err(|e| anyhow!(e))?;
         let native_before = self.native_session_marker();
         let baseline_epoch = self.output_epoch();
         let clear_after_interrupt = self.inner.clear_next_submit.swap(false, Ordering::AcqRel);
@@ -1930,6 +1789,13 @@ impl AgentTerminalPty {
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".into()),
         ));
+        if let Some(handoff) = &handoff {
+            if let Err(error) = crate::shell_switch::submitted(&metadata_cwd, handoff) {
+                // The input has already been submitted. Returning Err here
+                // would make bus recovery deliver the original input again.
+                crate::kota_debug_log(&format!("[shell-switch] submitted handoff cleanup failed: {error}"));
+            }
+        }
         Ok(())
     }
 
@@ -2270,6 +2136,9 @@ impl AgentTerminalPty {
 
     fn spawn(&self, app: &AppHandle) -> Result<()> {
         if !self.inner.launch_prepared.swap(false, Ordering::AcqRel) {
+            if self.inner.project_root.join(".agent-workspaces").join(&self.inner.agent_id).join("agent.yaml").is_file() {
+                return Err(anyhow!("agent process needs to be launched again"));
+            }
             self.prepare_launch()?;
         }
         if self.inner.inputs.is_closed() {
@@ -2295,16 +2164,13 @@ impl AgentTerminalPty {
         let bin = self.inner.cli.bin();
         let env_path = augmented_path(Some(&self.inner.home));
         let resolved_bin = resolve_on_augmented_path(bin, Some(&self.inner.home));
-        let opencode_launch_mode =
-            resolve_opencode_launch_mode(self.inner.cli, resolved_bin.as_str());
         let mut cmd = CommandBuilder::new(resolved_bin.as_str());
         cmd.cwd(&self.inner.cwd);
-        let spawn_args = args_for_spawn_with_opencode_launch_mode(
+        let spawn_args = build_spawn_args(
             self.inner.cli,
             &self.inner.args,
             &self.inner.cwd,
             self.inner.session_id.as_deref(),
-            opencode_launch_mode,
         );
         for arg in &spawn_args {
             cmd.arg(arg.as_str());
@@ -2824,7 +2690,7 @@ impl AgentTerminalPty {
     /// registry on respawn so the frontend's exit listener (which is
     /// keyed by agent_id, same topic for old and new) doesn't see a
     /// phantom exit and clear `liveAgents`.
-    pub fn stop_silently(&self) {
+    fn stop_for_replacement(&self) -> Result<()> {
         let lost = self
             .inner
             .inputs
@@ -2835,7 +2701,17 @@ impl AgentTerminalPty {
                 self.inner.agent_id, lost
             ));
         }
-        self.stop_current();
+        self.inner.generation.fetch_add(1, Ordering::SeqCst);
+        let mut process = self.inner.process.lock().expect("agent process poisoned");
+        if let Some(current) = process.as_mut() {
+            if let Err(error) = current.killer.kill() {
+                if current.child_pid.is_none_or(process_is_alive) {
+                    return Err(anyhow!("could not stop the previous agent process: {error}"));
+                }
+            }
+        }
+        process.take();
+        Ok(())
     }
 
     fn emit_status(&self, app: &AppHandle, running: bool) {
@@ -3075,80 +2951,122 @@ impl AgentRegistry {
     }
 
     pub fn spawn(&self, app: &AppHandle, req: AgentSpawnRequest) -> Result<AgentRoute> {
-        let agent_id = req.agent_id.clone();
-        let replacement = self.replacement(&agent_id);
+        let replacement = self.replacement(&req.agent_id);
         let epoch = replacement.epoch.fetch_add(1, Ordering::SeqCst) + 1;
-        let _replacement_guard = replacement
-            .serial
-            .lock()
-            .expect("agent replacement poisoned");
+        let _guard = replacement.serial.lock().expect("agent replacement poisoned");
+        self.spawn_serial(app, req, &replacement, epoch)
+    }
+
+    fn spawn_serial(&self, app: &AppHandle, mut req: AgentSpawnRequest, replacement: &Replacement, epoch: u64) -> Result<AgentRoute> {
+        let agent_id = req.agent_id.clone();
+        let previous = self.lookup(&agent_id).ok();
+        if previous.as_ref().is_some_and(|p| p.inner.project_root.canonicalize().ok() != Path::new(&req.project_root).canonicalize().ok()) {
+            return Err(anyhow!("agent launch project does not match the registered incarnation"));
+        }
+        let live = previous.as_ref().filter(|p| p.is_running() && !p.submit_child_is_dead())
+            .map(|p| p.inner.cli)
+            .or_else(|| live_provider_for(Path::new(&req.project_root), &agent_id,
+                &Path::new(&req.project_root).join(".agent-workspaces").join(&agent_id)));
+        let lease_path = agent_session_lease_path(&req);
+        let foreign = active_foreign_agent_session_lease(&lease_path);
+        if let Some(lease) = &foreign {
+            if !req.takeover { return Err(lease_conflict_error(lease)); }
+        }
+        let mut launch = crate::shell_switch::Launch::prepare(&mut req, live).map_err(|e| anyhow!(e))?;
         let pty = AgentTerminalPty::new(req.clone())?;
-        pty.prepare_launch()?;
+        if let Some(launch) = launch.as_mut() {
+            let binary = resolve_on_augmented_path(req.cli.bin(), dirs::home_dir().as_deref());
+            if !Path::new(&binary).is_file() { return Err(anyhow!("provider executable is unavailable: {}", req.cli.bin())); }
+            launch.prepare_adapter().map_err(|e| anyhow!(e))?;
+        } else { pty.prepare_launch()?; }
         pty.inner.launch_prepared.store(true, Ordering::Release);
         pty.inner.inputs.hold_start();
         if replacement.epoch.load(Ordering::SeqCst) != epoch {
             return Err(anyhow!("agent startup cancelled or superseded"));
         }
-        let lease_path = agent_session_lease_path(&req);
-        if let Some(lease) = active_foreign_agent_session_lease(&lease_path) {
-            if req.takeover {
-                terminate_foreign_agent_session(&lease);
-            } else {
-                return Err(lease_conflict_error(&lease));
+        if let Some(lease) = foreign { terminate_foreign_agent_session(&lease); }
+        if let Some(previous) = previous { previous.stop_for_replacement()?; }
+        self.ptys.lock().expect("agent registry poisoned").insert(agent_id.clone(), pty.clone());
+        let result = (|| {
+            if replacement.epoch.load(Ordering::SeqCst) != epoch { return Err(anyhow!("agent startup cancelled or superseded")); }
+            pty.init(app)?;
+            if replacement.epoch.load(Ordering::SeqCst) != epoch { return Err(anyhow!("agent startup cancelled or superseded")); }
+            let now = Utc::now().to_rfc3339();
+            write_agent_session_lease(&lease_path, &AgentSessionLease {
+                version: 1, agent_id: agent_id.clone(), cli: req.cli, cwd: req.cwd.clone(),
+                project_root: req.project_root.clone(), owner_pid: std::process::id(), child_pid: pty.child_pid(),
+                session_id: req.session_id.clone(), created_at: now.clone(), updated_at: now,
+            })?;
+            if let Some(launch) = launch.as_mut() { launch.commit(req.session_id.as_deref()).map_err(|e| anyhow!(e))?; }
+            Ok(pty.route())
+        })();
+        if let Err(error) = result {
+            let stop_error = pty.stop_for_replacement().err();
+            let rollback_error = launch.as_mut().and_then(|launch| launch.rollback().err());
+            let mut ptys = self.ptys.lock().expect("agent registry poisoned");
+            // A failed kill must retain its owner so a later close/retry can
+            // still reach that process; never orphan it behind an error.
+            if stop_error.is_none() && ptys.get(&agent_id).is_some_and(|current| Arc::ptr_eq(&current.inner, &pty.inner)) {
+                ptys.remove(&agent_id);
             }
+            return Err(anyhow!("{error}{}{}",
+                stop_error.map(|e| format!("; new process cleanup failed: {e}")).unwrap_or_default(),
+                rollback_error.map(|e| format!("; projection rollback failed: {e}")).unwrap_or_default()));
         }
-        let lease_cli = req.cli;
-        let lease_cwd = req.cwd.clone();
-        let lease_project_root = req.project_root.clone();
-        let lease_session_id = req.session_id.clone();
-        // Publish a held incarnation so close and arriving input can find it.
-        // Release the registry lock before stopping the previous process.
-        let previous = self
-            .ptys
-            .lock()
-            .expect("agent registry poisoned")
-            .insert(agent_id.clone(), pty.clone());
-        if let Some(previous) = previous {
-            previous.stop_silently();
-        }
-        if replacement.epoch.load(Ordering::SeqCst) != epoch {
-            pty.stop_silently();
-            return Err(anyhow!("agent startup cancelled or superseded"));
-        }
-        let route = pty.route();
-        pty.init(app)?;
-        if replacement.epoch.load(Ordering::SeqCst) != epoch {
-            pty.stop_silently();
-            return Err(anyhow!("agent startup cancelled or superseded"));
-        }
-        let now = Utc::now().to_rfc3339();
-        if let Err(err) = write_agent_session_lease(
-            &lease_path,
-            &AgentSessionLease {
-                version: 1,
-                agent_id: agent_id.clone(),
-                cli: lease_cli,
-                cwd: lease_cwd,
-                project_root: lease_project_root,
-                owner_pid: std::process::id(),
-                child_pid: pty.child_pid(),
-                session_id: lease_session_id,
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        ) {
-            pty.stop_silently();
-            return Err(err);
-        }
-        Ok(route)
+        result
+    }
+
+    fn ready_for_input(&self, app: &AppHandle, agent_id: &str, replacement: &Replacement) -> Result<AgentTerminalPty> {
+        let pty = self.lookup(agent_id)?;
+        if pty.is_running() && !pty.submit_child_is_dead() { return Ok(pty); }
+        let state = &pty.inner;
+        let request = AgentSpawnRequest {
+            agent_id: state.agent_id.clone(), cli: state.cli, cwd: state.cwd.display().to_string(),
+            project_root: state.project_root.display().to_string(), worktree_root: Some(state.worktree_root.display().to_string()),
+            shared_dir: Some(state.shared_dir.display().to_string()), rules_dir: Some(state.rules_dir.display().to_string()),
+            adapter_path: state.adapter_path.as_ref().map(|p| p.display().to_string()), args: state.args.clone(),
+            session_id: state.session_id.clone(), project_id: state.project_id.clone(),
+            project_remote: state.project_remote.clone(), project_base_ref: state.project_base_ref.clone(),
+            takeover: false, fresh_session: false,
+        };
+        let epoch = replacement.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        self.spawn_serial(app, request, replacement, epoch)?;
+        self.lookup(agent_id)
     }
 
     pub fn write(&self, app: &AppHandle, agent_id: &str, input: String) -> Result<()> {
-        self.lookup(agent_id)?.write(app, input)
+        let Some(input) = self.try_write_running(app, agent_id, input)? else {
+            return Ok(());
+        };
+        let replacement = self.replacement(agent_id);
+        let _guard = replacement.serial.lock().expect("agent replacement poisoned");
+        self.ready_for_input(app, agent_id, &replacement)?.write(app, input)
     }
 
-    pub fn submit_prompt(&self, app: &AppHandle, agent_id: &str, input: String) -> Result<()> {
-        self.lookup(agent_id)?.submit_prompt(app, input)
+    pub(crate) fn try_write_running(&self, app: &AppHandle, agent_id: &str, input: String) -> Result<Option<String>> {
+        let current = self.lookup(agent_id)?;
+        if current.is_running() && !current.submit_child_is_dead() {
+            // Raw terminal input stays bound to this process and retains the
+            // existing fast path; it never consumes a pending handoff.
+            current.write(app, input)?;
+            return Ok(None);
+        }
+        Ok(Some(input))
+    }
+
+    pub(crate) fn submit_prompt(&self, app: &AppHandle, agent_id: &str, input: String, source: crate::shell_switch::PromptSource) -> Result<()> {
+        let replacement = self.replacement(agent_id);
+        let _guard = replacement.serial.lock().expect("agent replacement poisoned");
+        if source != crate::shell_switch::PromptSource::Composer {
+            let pty = self.lookup(agent_id)?;
+            if !pty.is_running() || pty.submit_child_is_dead() {
+                // Bus owns its existing single fallback launch. Do not attempt
+                // one here and then launch again when it receives that error.
+                return Err(anyhow!("agent process needs to be launched again"));
+            }
+            return pty.submit_prompt(app, input, source);
+        }
+        self.ready_for_input(app, agent_id, &replacement)?.submit_prompt(app, input, source)
     }
 
     pub fn resize(&self, agent_id: &str, cols: u16, rows: u16) -> Result<()> {
@@ -3424,15 +3342,12 @@ mod tests {
                 Some("opencode-session-1"),
             ),
             vec![
-                "run".to_string(),
-                "--interactive".to_string(),
+                "--mini".to_string(),
                 "--session".to_string(),
                 "opencode-session-1".to_string(),
                 "--model".to_string(),
                 "x".to_string(),
                 "--pure".to_string(),
-                "--dangerously-skip-permissions".to_string(),
-                "--dir".to_string(),
                 "/tmp/agent-cwd".to_string()
             ]
         );
@@ -3546,11 +3461,20 @@ mod tests {
         let marker = kimi_session_marker_in(&kimi_home, &cwd, Some("session_kimi_1"))
             .expect("matching Kimi main wire marker");
         assert!(matches!(marker, NativeSessionMarker::File { path, .. } if path == main_wire));
+
+        fs::write(
+            matching.join("state.json"),
+            serde_json::json!({"cwd": cwd.to_str().unwrap()}).to_string(),
+        )
+        .unwrap();
+        let marker = kimi_session_marker_in(&kimi_home, &cwd, Some("session_kimi_1"))
+            .expect("matching Kimi main wire marker with current cwd field");
+        assert!(matches!(marker, NativeSessionMarker::File { path, .. } if path == main_wire));
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn opencode_spawn_args_use_pure_direct_interactive_mode() {
+    fn opencode_spawn_args_use_pure_mini_mode() {
         assert_eq!(
             args_for_spawn(
                 AgentCli::Opencode,
@@ -3563,13 +3487,10 @@ mod tests {
                 None,
             ),
             vec![
-                "run".to_string(),
-                "--interactive".to_string(),
+                "--mini".to_string(),
                 "--model".to_string(),
                 "kimi-for-coding/k2p6".to_string(),
-                "--dangerously-skip-permissions".to_string(),
                 "--pure".to_string(),
-                "--dir".to_string(),
                 "/tmp/agent-cwd".to_string()
             ]
         );
@@ -3585,20 +3506,17 @@ mod tests {
                 None,
             ),
             vec![
-                "run".to_string(),
-                "--interactive".to_string(),
-                "--dir".to_string(),
-                "/tmp/manual".to_string(),
+                "--mini".to_string(),
                 "--pure".to_string(),
-                "--dangerously-skip-permissions".to_string()
+                "/tmp/manual".to_string()
             ]
         );
     }
 
     #[test]
-    fn opencode_spawn_args_use_mini_mode_when_interactive_flag_is_unavailable() {
+    fn opencode_spawn_args_strip_legacy_permission_flag() {
         assert_eq!(
-            args_for_spawn_with_opencode_launch_mode(
+            args_for_spawn(
                 AgentCli::Opencode,
                 &[
                     "--model".into(),
@@ -3607,10 +3525,6 @@ mod tests {
                 ],
                 Path::new("/tmp/agent-cwd"),
                 None,
-                OpencodeLaunchMode::Mini {
-                    supports_dangerously_skip_permissions: false,
-                    supports_session: true,
-                },
             ),
             vec![
                 "--mini".to_string(),
@@ -3623,46 +3537,17 @@ mod tests {
     }
 
     #[test]
-    fn opencode_mini_spawn_args_keep_dangerous_flag_when_supported() {
+    fn opencode_spawn_args_preserve_explicit_session() {
         assert_eq!(
-            args_for_spawn_with_opencode_launch_mode(
+            args_for_spawn(
                 AgentCli::Opencode,
-                &["--model".into(), "x".into()],
-                Path::new("/tmp/agent-cwd"),
-                None,
-                OpencodeLaunchMode::Mini {
-                    supports_dangerously_skip_permissions: true,
-                    supports_session: true,
-                },
-            ),
-            vec![
-                "--mini".to_string(),
-                "--model".to_string(),
-                "x".to_string(),
-                "--pure".to_string(),
-                "--dangerously-skip-permissions".to_string(),
-                "/tmp/agent-cwd".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn opencode_mini_spawn_args_preserve_session_when_supported() {
-        assert_eq!(
-            args_for_spawn_with_opencode_launch_mode(
-                AgentCli::Opencode,
-                &["--model".into(), "x".into()],
+                &["--session=manual".into(), "--model".into(), "x".into()],
                 Path::new("/tmp/agent-cwd"),
                 Some("opencode-session-1"),
-                OpencodeLaunchMode::Mini {
-                    supports_dangerously_skip_permissions: false,
-                    supports_session: true,
-                },
             ),
             vec![
                 "--mini".to_string(),
-                "--session".to_string(),
-                "opencode-session-1".to_string(),
+                "--session=manual".to_string(),
                 "--model".to_string(),
                 "x".to_string(),
                 "--pure".to_string(),
@@ -3672,40 +3557,13 @@ mod tests {
     }
 
     #[test]
-    fn opencode_mini_spawn_args_strip_session_when_unsupported() {
+    fn opencode_spawn_args_translate_dir_equals_to_project() {
         assert_eq!(
-            args_for_spawn_with_opencode_launch_mode(
+            args_for_spawn(
                 AgentCli::Opencode,
-                &["--model".into(), "x".into()],
-                Path::new("/tmp/agent-cwd"),
-                Some("opencode-session-1"),
-                OpencodeLaunchMode::Mini {
-                    supports_dangerously_skip_permissions: false,
-                    supports_session: false,
-                },
-            ),
-            vec![
-                "--mini".to_string(),
-                "--model".to_string(),
-                "x".to_string(),
-                "--pure".to_string(),
-                "/tmp/agent-cwd".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn opencode_mini_spawn_args_translate_explicit_dir_to_project() {
-        assert_eq!(
-            args_for_spawn_with_opencode_launch_mode(
-                AgentCli::Opencode,
-                &["--dir".into(), "/tmp/manual".into()],
+                &["--dir=/tmp/manual".into()],
                 Path::new("/tmp/agent-cwd"),
                 None,
-                OpencodeLaunchMode::Mini {
-                    supports_dangerously_skip_permissions: false,
-                    supports_session: true,
-                },
             ),
             vec![
                 "--mini".to_string(),
@@ -3716,42 +3574,26 @@ mod tests {
     }
 
     #[test]
-    fn opencode_explicit_subcommand_is_not_rewritten_for_mini_mode() {
+    fn opencode_explicit_subcommand_is_not_rewritten_as_mini() {
         assert_eq!(
-            args_for_spawn_with_opencode_launch_mode(
+            args_for_spawn(
                 AgentCli::Opencode,
-                &["run".into(), "--model".into(), "x".into()],
+                &["models".into()],
                 Path::new("/tmp/agent-cwd"),
                 None,
-                OpencodeLaunchMode::Mini {
-                    supports_dangerously_skip_permissions: false,
-                    supports_session: true,
-                },
             ),
-            vec![
-                "run".to_string(),
-                "--model".to_string(),
-                "x".to_string(),
-                "--pure".to_string(),
-                "--dangerously-skip-permissions".to_string(),
-                "--dir".to_string(),
-                "/tmp/agent-cwd".to_string()
-            ]
+            vec!["models".to_string(), "--pure".to_string()]
         );
     }
 
     #[test]
-    fn non_opencode_spawn_args_ignore_opencode_launch_mode() {
+    fn non_opencode_spawn_args_do_not_use_mini() {
         assert_eq!(
-            args_for_spawn_with_opencode_launch_mode(
+            args_for_spawn(
                 AgentCli::Codex,
                 &["--ask-for-approval=never".into()],
                 Path::new("/tmp/agent-cwd"),
                 Some("codex-session-1"),
-                OpencodeLaunchMode::Mini {
-                    supports_dangerously_skip_permissions: false,
-                    supports_session: true,
-                },
             ),
             vec![
                 "resume".to_string(),
@@ -3759,37 +3601,6 @@ mod tests {
                 "--ask-for-approval=never".to_string()
             ]
         );
-    }
-
-    #[test]
-    fn opencode_run_help_probe_detects_legacy_interactive_flag() {
-        assert!(opencode_run_help_supports_interactive(
-            "  -i, --interactive  run in direct interactive split-footer mode"
-        ));
-        assert!(!opencode_run_help_supports_interactive(
-            "      --dangerously-skip-permissions  auto-approve permissions\n      --dir  directory"
-        ));
-    }
-
-    #[test]
-    fn opencode_mini_help_probe_detects_session_support() {
-        let mini_help = "      --session  session id to continue\n      --model  model to use";
-        assert!(opencode_mini_help_supports_session(mini_help));
-        assert!(!opencode_mini_help_supports_session(
-            "      --model  model to use"
-        ));
-    }
-
-    #[test]
-    fn opencode_mini_help_probe_detects_dangerous_flag_support() {
-        let mini_help =
-            "      --dangerously-skip-permissions  auto-approve permissions\n      --model";
-        assert!(opencode_mini_help_supports_dangerously_skip_permissions(
-            mini_help
-        ));
-        assert!(!opencode_mini_help_supports_dangerously_skip_permissions(
-            "      --session  session id to continue"
-        ));
     }
 
     #[test]
@@ -3947,6 +3758,7 @@ mod tests {
             project_remote: None,
             project_base_ref: None,
             takeover: false,
+            fresh_session: false,
         };
         // PathBuf::exists won't fail for /tmp on test hosts; if it does the test
         // is irrelevant, so skip.

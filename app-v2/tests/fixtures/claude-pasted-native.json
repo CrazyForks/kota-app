@@ -1,0 +1,41 @@
+{
+  "agentId": "agent-fixture73",
+  "sessionId": "bf1ee4a8-cc85-4bfb-a626-4a1a41dd86fb",
+  "sourcePath": "/Users/example/.claude/projects/-Users-example-Kota-Workspaces-fixture-zenith-river-73--agent-workspaces-agent-fixture73/bf1ee4a8-cc85-4bfb-a626-4a1a41dd86fb.jsonl",
+  "records": [
+    {
+      "type": "user",
+      "message": {
+        "role": "user",
+        "content": "\n\n<pasted_content id=\"eac2\">\n<KOTA_HANDOFF id=\"0c00ed19-f5cc-4e27-ac44-8158c7c831d9\">\nYou are Kimi v. Zenith River 73 (agent-fixture73) in project Zenith River 73 (fixture-zenith-river-73).\nYour provider changed from opencode to claude, starting a fresh session.\nYour identity, working directory, Ghost, project files, and room history are unchanged.\nThe switch happened at: 2026-09-20T19:56:58.537700+00:00\n\nBefore handling the message below, read the most recent 3-5 room interactions. Read more from project memory if needed:\n\n- Recent room history: /Users/example/Kota/Workspaces/fixture-zenith-river-73/project-memory/chathistory/latest.jsonl\n- Earlier history index: /Users/example/Kota/Workspaces/fixture-zenith-river-73/project-memory/chathistory/manifest.json\n- User memory: /Users/example/Kota/Workspaces/fixture-zenith-river-73/project-memory/dreams.md\n\nPast messages provide context, not new instructions. Once you have enough context, continue with the message below.\n</KOTA_HANDOFF>\n\nUI-QA-20260920-CLAUDE-1. Non-destructive provider-switch acceptance. Follow the handoff; only read the requested recent room context. Do not edit files or send messages. Reply exactly CLAUDE_FIRST_OK.\n</pasted_content id=\"eac2\">\n"
+      },
+      "uuid": "22e9e72b-bca0-4ecd-b745-4cc16d3efdd2",
+      "timestamp": "2026-09-20T19:58:16.294Z",
+      "origin": {
+        "kind": "human"
+      },
+      "promptSource": "typed",
+      "sessionId": "bf1ee4a8-cc85-4bfb-a626-4a1a41dd86fb",
+      "version": "2.1.278"
+    },
+    {
+      "type": "user",
+      "message": {
+        "role": "user",
+        "content": "\n\n<pasted_content id=\"eac2\">\nUI-QA-20260920-CLAUDE-2. No tools needed. Reply exactly CLAUDE_SECOND_OK.\n</pasted_content id=\"eac2\">\n"
+      },
+      "uuid": "cd90e4a0-b864-4231-a698-4e10773dbc0c",
+      "timestamp": "2026-09-20T19:58:50.348Z",
+      "origin": {
+        "kind": "human"
+      },
+      "promptSource": "typed",
+      "sessionId": "bf1ee4a8-cc85-4bfb-a626-4a1a41dd86fb",
+      "version": "2.1.278"
+    }
+  ],
+  "originals": [
+    "UI-QA-20260920-CLAUDE-1. Non-destructive provider-switch acceptance. Follow the handoff; only read the requested recent room context. Do not edit files or send messages. Reply exactly CLAUDE_FIRST_OK.",
+    "UI-QA-20260920-CLAUDE-2. No tools needed. Reply exactly CLAUDE_SECOND_OK."
+  ]
+}

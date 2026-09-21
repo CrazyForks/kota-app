@@ -447,6 +447,10 @@ enum RoomExceptionReshape {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct NativeEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shell_handoff: Option<crate::shell_switch::ProjectedHandoff>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handoff_bus_id: Option<String>,
     session_id: String,
     agent_id: String,
     shell: String,
@@ -721,6 +725,7 @@ pub fn sync_project(
             status.status = "error".into();
             status.error = Some(err);
         } else if let Some(session_id) = output_session_id {
+            let parsed = expand_shell_handoffs(parsed);
             status.parsed = parsed.len();
             agent_bus_receipts.extend(parsed.iter().filter_map(agent_bus_receipt_from_event));
             let parsed = filter_internal_agent_bus_envelopes(filter_bootstrap_noise(parsed));
@@ -796,7 +801,7 @@ fn agent_bus_receipt_from_event(event: &NativeEvent) -> Option<AgentBusReceipt> 
     if event.role != "user" || event.kind != "message" {
         return None;
     }
-    let event_id = agent_bus_envelope_event_id(&event.text)?;
+    let event_id = event.handoff_bus_id.clone().or_else(|| agent_bus_envelope_event_id(&event.text))?;
     if !event_id.starts_with("agentbus-") {
         return None;
     }
@@ -1733,34 +1738,60 @@ fn locate_native_source_for_project(
     project_root: &Path,
     agent: &ProjectAgent,
 ) -> Result<Option<NativeSource>, String> {
-    if agent.shell == "codex" {
-        if let Some(source) = locate_native_source(agent)? {
-            if native_source_is_after_agent_session_reset(agent, &source) {
-                store_project_native_source(agent, &source);
-                persist_agent_session_binding(agent, &source);
-                return Ok(Some(source));
-            }
+    let lock = crate::shell_switch::metadata_lock(&agent.cwd);
+    let expected = {
+        let state = lock.lock().unwrap();
+        if state.starting.is_some() { return Ok(None); }
+        let yaml = read_yaml_file(&agent.cwd.join("agent.yaml"))?;
+        if let Some(yaml) = &yaml {
+            if !binding_agent_matches(agent, yaml) { return Ok(None); }
         }
-        if let Some(source) = cached_codex_source(agent)? {
-            if native_source_is_after_agent_session_reset(agent, &source) {
-                persist_agent_session_binding(agent, &source);
-                return Ok(Some(source));
-            }
-        }
-        return Ok(cached_native_source_from_raw_logs(project_root, agent)?
-            .filter(|source| native_source_is_after_agent_session_reset(agent, source)));
+        yaml.as_ref().map(binding_fingerprint)
+    };
+    // Native lookup can take time. Recheck the exact provider/session generation
+    // after it returns, serialized with Save and actual startup commit.
+    let mut source = locate_native_source(agent)?
+        .filter(|source| native_source_is_after_agent_session_reset(agent, source));
+    if source.is_none() && agent.shell == "codex" {
+        source = cached_codex_source(agent)?
+            .filter(|source| native_source_is_after_agent_session_reset(agent, source));
     }
+    if source.is_none() {
+        source = cached_native_source_from_raw_logs(project_root, agent)?
+            .filter(|source| native_source_is_after_agent_session_reset(agent, source));
+    }
+    finish_source_lookup(agent, expected, source)
+}
 
-    let source = locate_native_source(agent)?;
-    if let Some(source) = source.as_ref() {
-        if native_source_is_after_agent_session_reset(agent, source) {
-            store_project_native_source(agent, source);
-            persist_agent_session_binding(agent, source);
-            return Ok(Some(source.clone()));
+fn finish_source_lookup(
+    agent: &ProjectAgent,
+    expected: Option<Vec<Option<String>>>,
+    source: Option<NativeSource>,
+) -> Result<Option<NativeSource>, String> {
+    let lock = crate::shell_switch::metadata_lock(&agent.cwd);
+    let state = lock.lock().unwrap();
+    let current = read_yaml_file(&agent.cwd.join("agent.yaml"))?;
+    if state.starting.is_some() || current.as_ref().map(binding_fingerprint) != expected {
+        return Ok(None);
+    }
+    if let Some(source) = &source {
+        store_project_native_source(agent, source);
+        if let Err(error) = write_agent_session_binding_locked(agent, source) {
+            crate::kota_debug_log(&format!("[violet] session binding: {error}"));
         }
     }
-    Ok(cached_native_source_from_raw_logs(project_root, agent)?
-        .filter(|source| native_source_is_after_agent_session_reset(agent, source)))
+    Ok(source)
+}
+
+fn binding_fingerprint(yaml: &YamlValue) -> Vec<Option<String>> {
+    ["provider", "shell", "shell-generation", "session-id", "sessionId", "session-reset-at", "sessionResetAt"]
+        .into_iter().map(|key| yaml_string(yaml, key)).collect()
+}
+
+fn binding_agent_matches(agent: &ProjectAgent, yaml: &YamlValue) -> bool {
+    let provider = yaml_string(yaml, "shell").or_else(|| yaml_string(yaml, "provider"));
+    provider.is_none_or(|p| normalize_shell(&p) == agent.shell)
+        && yaml_string(yaml, "session-id").or_else(|| yaml_string(yaml, "sessionId")) == agent.session_id
 }
 
 fn cached_project_native_source(
@@ -1781,19 +1812,14 @@ fn store_project_native_source(agent: &ProjectAgent, source: &NativeSource) {
     }
 }
 
-fn persist_agent_session_binding(agent: &ProjectAgent, source: &NativeSource) {
-    if agent.session_id.as_deref() == Some(source.session_id.as_str()) {
-        return;
-    }
-    if let Err(err) = write_agent_session_binding(agent, source) {
-        crate::kota_debug_log(&format!(
-            "[violet] failed to persist session binding for {}: {}",
-            agent.agent_id, err
-        ));
-    }
+fn write_agent_session_binding(agent: &ProjectAgent, source: &NativeSource) -> Result<(), String> {
+    let lock = crate::shell_switch::metadata_lock(&agent.cwd);
+    let state = lock.lock().unwrap();
+    if state.starting.is_some() { return Ok(()); }
+    write_agent_session_binding_locked(agent, source)
 }
 
-fn write_agent_session_binding(agent: &ProjectAgent, source: &NativeSource) -> Result<(), String> {
+fn write_agent_session_binding_locked(agent: &ProjectAgent, source: &NativeSource) -> Result<(), String> {
     let path = agent.cwd.join("agent.yaml");
     if !path.is_file() {
         return Ok(());
@@ -1802,6 +1828,9 @@ fn write_agent_session_binding(agent: &ProjectAgent, source: &NativeSource) -> R
         fs::read_to_string(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
     let mut yaml: YamlValue =
         serde_yaml::from_str(&text).map_err(|err| format!("parse {}: {err}", path.display()))?;
+    if !binding_agent_matches(agent, &yaml) || !native_source_is_after_agent_session_reset(agent, source) {
+        return Ok(());
+    }
     let existing_session_id =
         yaml_string(&yaml, "session-id").or_else(|| yaml_string(&yaml, "sessionId"));
     if existing_session_id.as_deref() == Some(source.session_id.as_str()) {
@@ -1816,8 +1845,12 @@ fn write_agent_session_binding(agent: &ProjectAgent, source: &NativeSource) -> R
     yaml_mapping_remove(map, "sessionId");
     yaml_mapping_remove(map, "sessionSource");
     yaml_mapping_remove(map, "sessionUpdatedAt");
-    yaml_mapping_remove(map, "session-reset-at");
-    yaml_mapping_remove(map, "sessionResetAt");
+    // New startup generations retain the birth cutoff even after binding; an
+    // old session written late must not become the next "latest" source.
+    if !map.contains_key(&YamlValue::String("shell-generation".into())) {
+        yaml_mapping_remove(map, "session-reset-at");
+        yaml_mapping_remove(map, "sessionResetAt");
+    }
     let next =
         serde_yaml::to_string(&yaml).map_err(|err| format!("serialize agent.yaml: {err}"))?;
     if next != text {
@@ -1827,13 +1860,33 @@ fn write_agent_session_binding(agent: &ProjectAgent, source: &NativeSource) -> R
 }
 
 fn native_source_is_after_agent_session_reset(agent: &ProjectAgent, source: &NativeSource) -> bool {
-    let Some(cutoff) = agent_session_reset_cutoff(agent) else {
+    let Some(reset) = session_reset(agent) else {
         return true;
     };
-    file_modified_time(&source.path) > cutoff
+    if source.kind == "opencode-sqlite" && reset.birth {
+        return opencode_session_created(&source.path, &source.session_id)
+            .is_some_and(|created| created >= reset.cutoff);
+    }
+    source_path_is_after_reset(&source.path, Some(reset))
 }
 
-fn agent_session_reset_cutoff(agent: &ProjectAgent) -> Option<SystemTime> {
+#[derive(Clone, Copy)]
+struct SessionReset { cutoff: SystemTime, birth: bool }
+
+fn source_path_is_after_reset(path: &Path, reset: Option<SessionReset>) -> bool {
+    let Some(reset) = reset else { return true; };
+    if reset.birth {
+        fs::metadata(path).and_then(|m| m.created()).is_ok_and(|created| created >= reset.cutoff)
+    } else { file_modified_time(path) > reset.cutoff }
+}
+
+fn opencode_session_created(db: &Path, session: &str) -> Option<SystemTime> {
+    let conn = open_opencode_db(db).ok()?;
+    let ms: i64 = conn.query_row("select time_created from session where id = ?1", [session], |r| r.get(0)).ok()?;
+    (ms >= 0).then(|| SystemTime::UNIX_EPOCH + StdDuration::from_millis(ms as u64))
+}
+
+fn session_reset(agent: &ProjectAgent) -> Option<SessionReset> {
     let path = agent.cwd.join("agent.yaml");
     let text = fs::read_to_string(&path).ok()?;
     let yaml: YamlValue = serde_yaml::from_str(&text).ok()?;
@@ -1845,7 +1898,10 @@ fn agent_session_reset_cutoff(agent: &ProjectAgent) -> Option<SystemTime> {
     if secs < 0 {
         return None;
     }
-    Some(SystemTime::UNIX_EPOCH + StdDuration::new(secs as u64, timestamp.timestamp_subsec_nanos()))
+    Some(SessionReset {
+        cutoff: SystemTime::UNIX_EPOCH + StdDuration::new(secs as u64, timestamp.timestamp_subsec_nanos()),
+        birth: yaml_string(&yaml, "shell-generation").is_some(),
+    })
 }
 
 fn locate_claude_source(agent: &ProjectAgent) -> Result<Option<NativeSource>, String> {
@@ -1860,8 +1916,10 @@ fn locate_claude_source_in(
     agent: &ProjectAgent,
 ) -> Result<Option<NativeSource>, String> {
     let project_dir = claude_project_dir(home, &agent.cwd);
+    let reset = session_reset(agent);
     if let Some((_, path)) = latest_file_by_mtime(&project_dir, |path| {
         path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+            && source_path_is_after_reset(path, reset)
     })? {
         let session_id = file_stem(&path).unwrap_or_else(|| source_session_id(&path));
         return Ok(Some(NativeSource {
@@ -1949,7 +2007,9 @@ fn locate_codex_source_in(
     });
 
     let mut requested_source = None;
+    let reset = session_reset(agent);
     for (_, path) in candidates {
+        if !source_path_is_after_reset(&path, reset) { continue; }
         let Some(meta) = read_codex_session_meta(&path)? else {
             continue;
         };
@@ -2199,8 +2259,10 @@ fn locate_antigravity_source(agent: &ProjectAgent) -> Result<Option<NativeSource
     };
     let app_dir = antigravity_app_dir(&home);
     let cwd_candidates = antigravity_cwd_candidates(agent);
+    let reset = session_reset(agent);
 
     if let Some(conversation_id) = antigravity_conversation_id_from_logs(&app_dir, &cwd_candidates)?
+        .filter(|id| source_path_is_after_reset(&preferred_antigravity_transcript_path(&app_dir, id), reset))
     {
         let path = preferred_antigravity_transcript_path(&app_dir, &conversation_id);
         return Ok(Some(NativeSource {
@@ -2213,7 +2275,7 @@ fn locate_antigravity_source(agent: &ProjectAgent) -> Result<Option<NativeSource
 
     if let Some(session_id) = agent.session_id.as_deref() {
         let path = preferred_antigravity_transcript_path(&app_dir, session_id);
-        if path.is_file() {
+        if path.is_file() && source_path_is_after_reset(&path, reset) {
             return Ok(Some(NativeSource {
                 kind: "antigravity-jsonl".into(),
                 session_id: session_id.to_string(),
@@ -2226,7 +2288,7 @@ fn locate_antigravity_source(agent: &ProjectAgent) -> Result<Option<NativeSource
     for cwd in &cwd_candidates {
         if let Some(conversation_id) = antigravity_conversation_id_for_cwd(&app_dir, &cwd)? {
             let path = preferred_antigravity_transcript_path(&app_dir, &conversation_id);
-            if path.is_file() {
+            if path.is_file() && source_path_is_after_reset(&path, reset) {
                 return Ok(Some(NativeSource {
                     kind: "antigravity-jsonl".into(),
                     session_id: conversation_id,
@@ -2248,6 +2310,7 @@ fn locate_antigravity_source(agent: &ProjectAgent) -> Result<Option<NativeSource
     let mut seen_sessions = HashSet::new();
     let mut unique_candidates = Vec::new();
     for path in candidates {
+        if !source_path_is_after_reset(&path, reset) { continue; }
         let session_id = antigravity_conversation_id_from_transcript(&path)
             .unwrap_or_else(|| source_session_id(&path));
         if seen_sessions.insert(session_id.clone()) {
@@ -2516,7 +2579,22 @@ fn locate_opencode_source(agent: &ProjectAgent) -> Result<Option<NativeSource>, 
     if !db_path.is_file() {
         return Ok(None);
     }
-    let session_id = latest_opencode_session_id(&agent.cwd)?.or(agent.session_id.clone());
+    let session_id = if let Some(reset) = session_reset(agent).filter(|reset| reset.birth) {
+        let conn = open_opencode_db(&db_path)?;
+        let mut stmt = conn.prepare("select id, directory, time_created from session order by time_updated desc limit 250")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))
+            .map_err(|e| e.to_string())?;
+        let mut found = None;
+        for row in rows {
+            let (id, directory, ms) = row.map_err(|e| e.to_string())?;
+            if paths_same(Path::new(&directory), &agent.cwd) && ms >= 0
+                && SystemTime::UNIX_EPOCH + StdDuration::from_millis(ms as u64) >= reset.cutoff {
+                found = Some(id); break;
+            }
+        }
+        found
+    } else { latest_opencode_session_id(&agent.cwd)?.or(agent.session_id.clone()) };
     let Some(session_id) = session_id else {
         return Ok(None);
     };
@@ -2546,7 +2624,7 @@ fn locate_pi_source(agent: &ProjectAgent) -> Result<Option<NativeSource>, String
             }));
         }
     }
-    if let Some((session_id, path)) = latest_pi_session_file(&sessions_dir, &agent.cwd)? {
+    if let Some((session_id, path)) = latest_pi_session_file(&sessions_dir, &agent.cwd, session_reset(agent))? {
         return Ok(Some(NativeSource {
             kind: PI_SOURCE_KIND.into(),
             session_id,
@@ -2576,6 +2654,7 @@ fn locate_kimi_source_in(
     agent: &ProjectAgent,
 ) -> Result<Option<NativeSource>, String> {
     let workspace_dirs = kimi_workspace_session_dirs(kimi_home, &agent.cwd)?;
+    let reset = session_reset(agent);
     if let Some(session_id) = agent
         .session_id
         .as_deref()
@@ -2584,7 +2663,7 @@ fn locate_kimi_source_in(
         for workspace_dir in &workspace_dirs {
             let session_dir = workspace_dir.join(session_id);
             let wire = session_dir.join("agents").join("main").join("wire.jsonl");
-            if wire.is_file() && kimi_state_matches_cwd(&session_dir, &agent.cwd)? {
+            if wire.is_file() && source_path_is_after_reset(&wire, reset) && kimi_state_matches_cwd(&session_dir, &agent.cwd)? {
                 return Ok(Some(NativeSource {
                     kind: KIMI_SOURCE_KIND.into(),
                     session_id: session_id.to_string(),
@@ -2615,7 +2694,7 @@ fn locate_kimi_source_in(
                 continue;
             };
             let wire = session_dir.join("agents").join("main").join("wire.jsonl");
-            if wire.is_file() {
+            if wire.is_file() && source_path_is_after_reset(&wire, reset) {
                 candidates.push((file_modified_time(&wire), session_id, wire));
             }
         }
@@ -2682,9 +2761,10 @@ fn kimi_state_matches_cwd(session_dir: &Path, cwd: &Path) -> Result<bool, String
     let state: JsonValue = serde_json::from_str(&text)
         .map_err(|err| format!("parse {}: {err}", state_path.display()))?;
     Ok(state
-        .get("workDir")
+        .get("cwd")
+        .or_else(|| state.get("workDir"))
         .and_then(JsonValue::as_str)
-        .is_some_and(|work_dir| paths_same(Path::new(work_dir), cwd)))
+        .is_some_and(|session_cwd| paths_same(Path::new(session_cwd), cwd)))
 }
 
 fn pi_sessions_dir(home: &Path) -> PathBuf {
@@ -2744,6 +2824,7 @@ fn locate_pi_session_file_by_id(
 fn latest_pi_session_file(
     sessions_dir: &Path,
     cwd: &Path,
+    reset: Option<SessionReset>,
 ) -> Result<Option<(String, PathBuf)>, String> {
     let project_dir = pi_project_session_dir(sessions_dir, cwd);
     let mut files = Vec::new();
@@ -2752,6 +2833,7 @@ fn latest_pi_session_file(
     })?;
     files.sort_by_key(|path| std::cmp::Reverse(file_modified_time(path)));
     for path in files {
+        if !source_path_is_after_reset(&path, reset) { continue; }
         let Some((session_id, session_cwd)) = read_pi_session_header(&path)? else {
             continue;
         };
@@ -2868,7 +2950,54 @@ fn parse_kimi_line(
         | "full_compaction.begin"
         | "context.apply_compaction"
         | "full_compaction.complete"
-        | "usage.record" => Vec::new(),
+        | "usage.record"
+        // Kimi Code CLI 2.x bookkeeping: runtime/profile/plugin binding,
+        // turn lifecycle, token counting, background-task lifecycle,
+        // file-history snapshots, approval audit trail, and a full message
+        // mirror whose content turn.prompt and context.append_loop_event
+        // already surface. Turn lifecycle signals come from step.begin /
+        // step.end loop events, so the agent.turn/turn records stay out too.
+        | "runtime.set_binding"
+        | "profile.bind"
+        | "plugin.session_start"
+        | "agent.message.appended"
+        | "agent.turn.started"
+        | "agent.turn.ended"
+        | "turn.ended"
+        | "prompt.completed"
+        | "token_counting.measured"
+        | "token_counting.turn_recorded"
+        | "task.started"
+        | "task.terminated"
+        | "task.waitDelivered"
+        | "file_history.tracked"
+        | "file_history.checkpoint"
+        | "interaction.resolved"
+        | "permission.record_approval_result" => Vec::new(),
+        "interaction.request" if json_string(&json, &["kind"]).as_deref() == Some("approval") => {
+            let (Some(id), Some(tool_name), Some(action)) = (
+                json_string(&json, &["id"]),
+                json_string(&json, &["request", "toolName"]),
+                json_string(&json, &["request", "action"]),
+            ) else {
+                return vec![kimi_unknown_event(
+                    agent, source, &timestamp, "record", &record_type,
+                )];
+            };
+            let mut approval = control_event(
+                agent,
+                source,
+                &timestamp,
+                &id,
+                "activity",
+                Some("permission_requested".into()),
+                None,
+            );
+            approval.text = format!(
+                "Permission requested: Kimi Code needs approval for {tool_name}: {action}.\nOpen the agent terminal to approve or deny it."
+            );
+            vec![approval]
+        }
         "tools.update_store" => parse_kimi_store_update(agent, source, index, &timestamp, &json),
         "turn.steer" => parse_kimi_turn_steer(agent, source, index, &timestamp, &json),
         "turn.prompt" => {
@@ -2899,6 +3028,34 @@ fn parse_kimi_line(
             Some("turn.cancel".into()),
             json_string(&json, &["turnId"]),
         )],
+        "turn.step.interrupted" if json_string(&json, &["reason"]).as_deref() == Some("error") => {
+            let turn_id = json_string(&json, &["turnId"]).or_else(|| {
+                json.get("turnId")
+                    .and_then(JsonValue::as_u64)
+                    .map(|id| id.to_string())
+            });
+            let mut failure = control_event(
+                agent,
+                source,
+                &timestamp,
+                &format!("kimi:{index}:step-error"),
+                "failed",
+                Some("error".into()),
+                turn_id,
+            );
+            // Keep the failed lifecycle even when no usable cause is supplied.
+            // Only the interrupted record surfaces the error body; the other
+            // turn-ending records remain bookkeeping and step.end stays hidden.
+            if let Some(message) = json_string(&json, &["message"])
+                .filter(|message| !message.trim().is_empty())
+            {
+                failure.role = "assistant".into();
+                failure.kind = "message".into();
+                failure.text =
+                    truncate_chars(&format!("Kimi Code error: {message}"), MAX_EVENT_TEXT_CHARS);
+            }
+            vec![failure]
+        }
         "context.append_loop_event" => {
             parse_kimi_loop_event(agent, source, index, &timestamp, json.get("event"))
         }
@@ -3874,6 +4031,15 @@ fn parse_claude_line(
         progress.work_signal = None;
         return vec![progress];
     }
+    // Claude's typed-input wrapper is transport syntax, regardless of the
+    // message inside. Normalize once before the existing classification paths.
+    let normalized = (role == "user"
+        && json_string(&json, &["origin", "kind"]).as_deref() == Some("human")
+        && json_string(&json, &["promptSource"]).as_deref() == Some("typed"))
+    .then(|| content.as_str().and_then(claude_pasted_input))
+    .flatten()
+    .map(|text| JsonValue::String(text.to_owned()));
+    let content = normalized.as_ref().unwrap_or(content);
     let mut events = content_blocks_to_events(agent, source, &role, &timestamp, &event_id, content)
         .into_iter()
         .filter(|event| !is_harness_envelope_text(&event.text))
@@ -4042,6 +4208,23 @@ fn parse_claude_hook_line(
     );
     event.text = text;
     vec![event]
+}
+
+fn claude_pasted_input(text: &str) -> Option<&str> {
+    let rest = text.trim().strip_prefix("<pasted_content id=\"")?;
+    let (id, rest) = rest.split_once("\">\n")?;
+    if id.is_empty()
+        || id.chars().any(|ch| {
+            ch.is_whitespace() || ch.is_control() || matches!(ch, '"' | '<' | '>')
+        })
+    {
+        return None;
+    }
+    // Use the first matching close so consecutive wrappers cannot be mistaken
+    // for one wrapper. Inner bytes are neither trimmed nor decoded.
+    let close = format!("\n</pasted_content id=\"{id}\">");
+    let (body, trailing) = rest.split_once(&close)?;
+    (!body.is_empty() && trailing.is_empty()).then_some(body)
 }
 
 /// True when an assistant entry is pre-tool narration ("Let me check X…") rather than a
@@ -4986,6 +5169,7 @@ fn parse_opencode_sqlite(
             .or_else(|| millis_to_iso(created_millis))
             .unwrap_or_else(now_iso);
         let mut parts = load_opencode_sqlite_parts(&conn, &source.session_id, &message_id)?;
+        prepare_opencode_message_parts(&role, &json, &mut parts);
         if parts.is_empty() {
             if let Some(part) = opencode_message_error_part(&json) {
                 parts.push(part);
@@ -5119,6 +5303,8 @@ fn opencode_permission_event_from_log_line(
     );
 
     Some(NativeEvent {
+        shell_handoff: None,
+        handoff_bus_id: None,
         session_id: source.session_id.clone(),
         agent_id: agent.agent_id.clone(),
         shell: agent.shell.clone(),
@@ -5211,6 +5397,7 @@ fn parse_opencode_message_dir(
         let event_id = json_string(&json, &["id"])
             .unwrap_or_else(|| file_stem(&path).unwrap_or_else(|| source_session_id(&path)));
         let mut parts = load_opencode_parts(source.aux_path.as_deref(), &event_id)?;
+        prepare_opencode_message_parts(&role, &json, &mut parts);
         if parts.is_empty() {
             if let Some(part) = opencode_message_error_part(&json) {
                 parts.push(part);
@@ -5309,6 +5496,7 @@ fn load_opencode_sqlite_parts(
 #[derive(Clone, Debug)]
 struct OpencodePartEvent {
     id: String,
+    part_type: String,
     kind: String,
     text: String,
     work_signal: Option<String>,
@@ -5320,6 +5508,7 @@ fn opencode_part_event(json: &JsonValue) -> Option<OpencodePartEvent> {
     if raw_kind == "step-start" {
         return Some(OpencodePartEvent {
             id: "step-start".into(),
+            part_type: raw_kind.clone(),
             kind: "control".into(),
             text: String::new(),
             work_signal: Some("activity".into()),
@@ -5333,6 +5522,7 @@ fn opencode_part_event(json: &JsonValue) -> Option<OpencodePartEvent> {
         let signal = opencode_work_signal_for_step_finish(&reason);
         return Some(OpencodePartEvent {
             id: "step-finish".into(),
+            part_type: raw_kind,
             kind: "control".into(),
             text: String::new(),
             work_signal: Some(signal.into()),
@@ -5358,11 +5548,64 @@ fn opencode_part_event(json: &JsonValue) -> Option<OpencodePartEvent> {
     }?;
     (!text.trim().is_empty()).then_some(OpencodePartEvent {
         id: raw_kind.clone(),
+        part_type: raw_kind,
         kind: kind.into(),
         text,
         work_signal: Some("activity".into()),
         reason: None,
     })
+}
+
+fn prepare_opencode_message_parts(
+    role: &str,
+    message: &JsonValue,
+    parts: &mut Vec<OpencodePartEvent>,
+) {
+    if role.eq_ignore_ascii_case("assistant") && !opencode_assistant_text_is_complete(message) {
+        parts.retain(|part| part.part_type != "text");
+    }
+    classify_opencode_message_parts(role, message, parts);
+}
+
+fn opencode_assistant_text_is_complete(message: &JsonValue) -> bool {
+    json_string(message, &["finish"]).is_some_and(|finish| !finish.trim().is_empty())
+        && message
+            .get("time")
+            .and_then(|time| time.get("completed"))
+            .and_then(JsonValue::as_i64)
+            .is_some()
+}
+
+/// OpenCode stores each completed assistant step as one message with sibling
+/// text, tool, and step-finish parts. Its message `finish` is authoritative:
+/// tool-call preambles fold into commentary while completed `stop` responses do
+/// not, regardless of other parts in the session.
+fn classify_opencode_message_parts(
+    role: &str,
+    message: &JsonValue,
+    parts: &mut [OpencodePartEvent],
+) {
+    if !role.eq_ignore_ascii_case("assistant") {
+        return;
+    }
+
+    let Some(finish) = json_string(message, &["finish"]).filter(|reason| !reason.trim().is_empty())
+    else {
+        return;
+    };
+    if !opencode_finish_is_tool_calls(&finish) {
+        return;
+    }
+
+    for part in parts {
+        if part.part_type == "text" && part.kind == "message" {
+            part.kind = "commentary".into();
+        }
+    }
+}
+
+fn opencode_finish_is_tool_calls(reason: &str) -> bool {
+    reason.trim().eq_ignore_ascii_case("tool-calls")
 }
 
 fn opencode_message_error_part(json: &JsonValue) -> Option<OpencodePartEvent> {
@@ -5386,6 +5629,7 @@ fn opencode_message_error_part(json: &JsonValue) -> Option<OpencodePartEvent> {
         .unwrap_or_default();
     Some(OpencodePartEvent {
         id: "error".into(),
+        part_type: "error".into(),
         kind: "message".into(),
         text: format!("OpenCode error{source}: {message}{status}."),
         work_signal: Some("failed".into()),
@@ -5718,13 +5962,29 @@ fn event(
     event_id: &str,
     text: String,
 ) -> NativeEvent {
-    let text = truncate_chars(&text, MAX_EVENT_TEXT_CHARS);
+    let mut handoff_bus_id = None;
+    let (shell_handoff, text) = if role == "user" {
+        // Providers can prepend attachment markers to a submitted text block.
+        // Recognize the handoff after those markers, but retain their exact
+        // bytes (and the original trailing whitespace) on the user message.
+        let candidate = strip_leading_provider_attachment_prefix(&text);
+        match crate::shell_switch::split_inline(candidate, &agent.agent_id) {
+            Some((handoff, original)) => {
+                let original = format!("{}{original}", &text[..text.len() - candidate.len()]);
+                handoff_bus_id = agent_bus_envelope_event_id(&original);
+                (Some(handoff), truncate_chars(&original, MAX_EVENT_TEXT_CHARS))
+            }
+            None => (None, truncate_chars(&text, MAX_EVENT_TEXT_CHARS)),
+        }
+    } else { (None, truncate_chars(&text, MAX_EVENT_TEXT_CHARS)) };
     let work_signal = match role {
         "assistant" => Some("activity".to_string()),
         "user" => Some("started".to_string()),
         _ => None,
     };
     NativeEvent {
+        shell_handoff,
+        handoff_bus_id,
         session_id: source.session_id.clone(),
         agent_id: agent.agent_id.clone(),
         shell: agent.shell.clone(),
@@ -5741,6 +6001,27 @@ fn event(
     }
 }
 
+fn expand_shell_handoffs(events: Vec<NativeEvent>) -> Vec<NativeEvent> {
+    let mut out = Vec::with_capacity(events.len());
+    for mut event in events {
+        if let Some(handoff) = event.shell_handoff.take() {
+            let mut whisper = event.clone();
+            whisper.text = handoff.text;
+            whisper.native_event_id = Some(format!("kota-handoff:{}", handoff.id));
+            whisper.role = "system".into();
+            whisper.kind = "message".into();
+            whisper.message_origin = Some("shell_handoff".into());
+            whisper.handoff_bus_id = None;
+            whisper.work_signal = None;
+            whisper.turn_id = None;
+            whisper.stop_reason = None;
+            out.push(whisper);
+        }
+        out.push(event);
+    }
+    out
+}
+
 fn control_event(
     agent: &ProjectAgent,
     source: &NativeSource,
@@ -5751,6 +6032,8 @@ fn control_event(
     turn_id: Option<String>,
 ) -> NativeEvent {
     NativeEvent {
+        shell_handoff: None,
+        handoff_bus_id: None,
         session_id: source.session_id.clone(),
         agent_id: agent.agent_id.clone(),
         shell: agent.shell.clone(),
@@ -6089,6 +6372,9 @@ fn dedupe_native_events(mut events: Vec<NativeEvent>) -> Vec<NativeEvent> {
 }
 
 fn native_event_dedupe_key(event: &NativeEvent) -> String {
+    if event.message_origin.as_deref() == Some("shell_handoff") {
+        return format!("{}: {}", event.agent_id, event.native_event_id.as_deref().unwrap_or_default());
+    }
     if event.kind == "control" {
         return format!(
             "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
@@ -6153,7 +6439,8 @@ fn filter_internal_agent_bus_envelopes(events: Vec<NativeEvent>) -> Vec<NativeEv
 }
 
 fn is_internal_agent_bus_envelope_event(event: &NativeEvent) -> bool {
-    event.role == "user" && event.kind == "message" && is_agent_bus_envelope_text(&event.text)
+    event.role == "user" && event.kind == "message"
+        && (event.handoff_bus_id.is_some() || is_agent_bus_envelope_text(&event.text))
 }
 
 fn is_agent_bus_envelope_text(text: &str) -> bool {
@@ -6162,8 +6449,12 @@ fn is_agent_bus_envelope_text(text: &str) -> bool {
         && trimmed.ends_with("</KOTA_MESSAGE>")
 }
 
-fn strip_leading_provider_attachment_markers(mut text: &str) -> &str {
-    text = trim_terminal_envelope_padding(text);
+fn strip_leading_provider_attachment_markers(text: &str) -> &str {
+    trim_terminal_envelope_padding(strip_leading_provider_attachment_prefix(text))
+}
+
+fn strip_leading_provider_attachment_prefix(mut text: &str) -> &str {
+    text = text.trim_start_matches(|ch: char| ch.is_whitespace() || ch.is_control());
     for _ in 0..8 {
         let Some(rest) = text.strip_prefix('[') else {
             break;
@@ -6175,7 +6466,7 @@ fn strip_leading_provider_attachment_markers(mut text: &str) -> &str {
         if !is_provider_attachment_marker(marker) {
             break;
         }
-        text = trim_terminal_envelope_padding(&rest[end + 1..]);
+        text = rest[end + 1..].trim_start_matches(|ch: char| ch.is_whitespace() || ch.is_control());
     }
     text
 }
@@ -9003,12 +9294,11 @@ fn looks_like_legacy_tool_block(content: &str, metadata: &str) -> bool {
 
 fn event_to_message(event: NativeEvent) -> VioletChatMessage {
     VioletChatMessage {
-        id: stable_message_id(
-            &event.session_id,
-            &event.agent_id,
-            &event.timestamp,
-            &event.text,
-        ),
+        id: if event.message_origin.as_deref() == Some("shell_handoff") {
+            stable_message_id("shell-handoff", &event.agent_id, "", event.native_event_id.as_deref().unwrap_or_default())
+        } else {
+            stable_message_id(&event.session_id, &event.agent_id, &event.timestamp, &event.text)
+        },
         session_id: event.session_id,
         agent_id: event.agent_id,
         shell: event.shell,
@@ -9340,10 +9630,11 @@ fn text_from_json(value: &JsonValue) -> Option<String> {
 }
 
 fn opencode_timestamp(json: &JsonValue) -> Option<String> {
-    let millis = json
-        .get("time")
-        .and_then(|time| time.get("completed").or_else(|| time.get("created")))
-        .and_then(|value| value.as_i64())?;
+    let time = json.get("time")?;
+    let millis = time
+        .get("created")
+        .and_then(JsonValue::as_i64)
+        .or_else(|| time.get("completed").and_then(JsonValue::as_i64))?;
     millis_to_iso(millis)
 }
 
@@ -9863,6 +10154,276 @@ mod tests {
     }
 
     #[test]
+    fn kimi_cli_2_bookkeeping_records_are_silently_ignored() {
+        let agent = kimi_agent(Path::new("/tmp/kota-kimi-agent"));
+        let source = kimi_source(Path::new("/tmp/kimi-wire.jsonl"));
+        // Shapes observed in a real Kimi Code CLI 2.0.2 session wire: binding,
+        // lifecycle, token counting, background-task lifecycle, file-history
+        // snapshots, approval audit trail, and message-mirror records are all
+        // bookkeeping. Lifecycle signals already come from step.begin/step.end
+        // loop events, and message content from turn.prompt and
+        // context.append_loop_event, so every record below surfaces zero room
+        // events. (Paths, commands, and hashes are scrubbed.)
+        let cases = [
+            serde_json::json!({"type": "runtime.set_binding", "workspaceId": "wd_x", "runtimeId": "local", "agentId": "main", "time": 1789932799440i64}),
+            serde_json::json!({"type": "profile.bind", "agentId": "main", "modelAlias": "kimi-code/kimi-for-coding", "profileName": "agent", "thinkingEffort": "high", "systemPrompt": "You are Kimi Code CLI…", "time": 1789932799440i64}),
+            serde_json::json!({"type": "plugin.session_start", "agentId": "main", "content": null, "time": 1789932799516i64}),
+            serde_json::json!({"type": "agent.message.appended", "message": {"message": {"role": "user", "content": [{"type": "text", "text": "hi"}]}, "meta": {"source": "input", "promptId": "msg_01M304", "origin": {"kind": "user"}}}, "time": 1789932799483i64, "kind": "event"}),
+            serde_json::json!({"type": "agent.turn.started", "turnId": 0, "queueItemId": "msg_01M304", "time": 1789932799483i64, "kind": "event"}),
+            serde_json::json!({"type": "agent.turn.ended", "turnId": 0, "outcome": "done", "time": 1789932803442i64, "kind": "event"}),
+            serde_json::json!({"type": "turn.ended", "agentId": "main", "turnId": 0, "reason": "completed", "durationMs": 3956, "traceId": "9d6f41b8f66cdad7c4212ba969fbe07c", "time": 1789932803445i64}),
+            serde_json::json!({"type": "prompt.completed", "agentId": "main", "promptId": "msg_01M304", "finishedAt": "2026-09-20T19:33:23.446Z", "reason": "completed", "time": 1789932803446i64}),
+            serde_json::json!({"type": "token_counting.measured", "agentId": "main", "length": 3, "tokens": 22190, "time": 1789932803437i64}),
+            serde_json::json!({"type": "token_counting.turn_recorded", "agentId": "main", "turnId": 0, "length": 3, "tokens": 22190, "time": 1789932803445i64}),
+            serde_json::json!({"type": "task.started", "agentId": "main", "info": {"taskId": "bash-x", "description": "Bash: …", "status": "running", "detached": true, "startedAt": 1789961156317i64, "timeoutMs": 600000, "kind": "process", "command": "…", "pid": 1234}, "time": 1789961456345i64}),
+            serde_json::json!({"type": "task.terminated", "agentId": "main", "info": {"taskId": "bash-x", "description": "Bash: …", "status": "completed", "detached": true, "startedAt": 1789961156317i64, "endedAt": 1789962056349i64, "kind": "process", "command": "…", "pid": 1234, "exitCode": 0}, "time": 1789962056384i64}),
+            serde_json::json!({"type": "task.waitDelivered", "agentId": "main", "keys": ["bash-x\u{0}completed\u{0}task:bash-x:completed"], "time": 1789962056405i64}),
+            serde_json::json!({"type": "file_history.tracked", "agentId": "main", "turnId": 4, "path": "/tmp/example.rs", "entry": {"key": "file-history/<hash>@v1", "version": 1, "contentHash": "<hash>", "size": 508309}, "time": 1789960803526i64}),
+            serde_json::json!({"type": "file_history.checkpoint", "agentId": "main", "turnId": 4, "phase": "end", "entries": {"/tmp/example.rs": {"key": "file-history/<hash>@v2", "version": 2, "contentHash": "<hash>", "size": 512093}}, "time": 1789964527957i64}),
+            serde_json::json!({"type": "permission.record_approval_result", "turnId": 4, "toolCallId": "tool_x", "toolName": "Bash", "action": "Running: …", "sessionApprovalRule": "Bash(…)", "result": {"decision": "approved", "scope": "session"}, "agentId": "main", "time": 1789963621509i64}),
+        ];
+        for record in cases {
+            assert!(parse_kimi_line(&agent, &source, 7, record).is_empty());
+        }
+        // The fail-closed net is untouched: unknown 2.x-flavoured types still
+        // produce exactly the record-scope canary, including unsupported or
+        // malformed interaction requests.
+        let canary_cases = [
+            serde_json::json!({"type": "token_counting.projected", "time": 1789932803500i64}),
+            serde_json::json!({"type": "interaction.request", "id": "question_x", "kind": "question", "time": 1789962782182i64}),
+            serde_json::json!({"type": "interaction.request", "id": "approval_x", "kind": "approval", "request": {"toolName": "Bash"}, "time": 1789962782182i64}),
+        ];
+        for record in canary_cases {
+            let events = parse_kimi_line(&agent, &source, 7, record);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].text, KIMI_UNKNOWN_EVENT_WARNING);
+        }
+    }
+
+    #[test]
+    fn kimi_approval_request_is_visible_control_with_stable_id() {
+        let agent = kimi_agent(Path::new("/tmp/kota-kimi-agent"));
+        let source = kimi_source(Path::new("/tmp/kimi-wire.jsonl"));
+        // Scrubbed real CLI 2.0.2 wire shape. action is already abbreviated
+        // by Kimi; preserve it verbatim instead of using display.command.
+        let action = "Running: rm -rf /tmp/kota-test/target/relea…";
+        let record = serde_json::json!({
+            "type": "interaction.request",
+            "agentId": "main",
+            "id": "approval_x",
+            "kind": "approval",
+            "toolCallId": "tool_x",
+            "request": {
+                "id": "approval_x",
+                "sessionId": "session_kimi",
+                "agentId": "main",
+                "turnId": 4,
+                "toolCallId": "tool_x",
+                "toolName": "Bash",
+                "action": action,
+                "display": {
+                    "kind": "command",
+                    "command": "rm -rf /tmp/kota-test/target/release && df -h / | tail -1",
+                    "cwd": "/tmp/kota-kimi-agent",
+                    "language": "bash"
+                }
+            },
+            "time": 1789962782182i64
+        });
+        let events = parse_kimi_line(&agent, &source, 392, record.clone());
+        assert_eq!(events.len(), 1);
+        let approval = &events[0];
+        assert_eq!(approval.role, "system");
+        assert_eq!(approval.kind, "control");
+        assert_eq!(approval.stop_reason.as_deref(), Some("permission_requested"));
+        assert_eq!(approval.work_signal.as_deref(), Some("activity"));
+        assert_eq!(approval.native_event_id.as_deref(), Some("approval_x"));
+        assert_eq!(
+            approval.text,
+            format!("Permission requested: Kimi Code needs approval for Bash: {action}.\nOpen the agent terminal to approve or deny it.")
+        );
+        assert!(is_visible_control_event(approval));
+        let (room, shared) = split_for_violet_outputs(events.clone(), Path::new("/tmp/kota"));
+        assert_eq!(room.len(), 1);
+        assert_eq!(shared.len(), 1);
+        assert_eq!(room[0].kind, "control");
+        assert_eq!(room[0].text, approval.text);
+        assert_eq!(shared[0].text, approval.text);
+
+        let rescanned = parse_kimi_line(&agent, &source, 999, record);
+        assert_eq!(rescanned.len(), 1);
+        assert_eq!(rescanned[0].native_event_id, approval.native_event_id);
+        assert_eq!(
+            event_to_message(rescanned[0].clone()).id,
+            event_to_message(approval.clone()).id
+        );
+    }
+
+    #[test]
+    fn kimi_approval_resolved_is_silently_ignored() {
+        let agent = kimi_agent(Path::new("/tmp/kota-kimi-agent"));
+        let source = kimi_source(Path::new("/tmp/kimi-wire.jsonl"));
+        let record = serde_json::json!({
+            "type": "interaction.resolved",
+            "agentId": "main",
+            "id": "approval_x",
+            "response": {"decision": "approved", "scope": "session"},
+            "time": 1789963621503i64
+        });
+        assert!(parse_kimi_line(&agent, &source, 393, record).is_empty());
+    }
+
+    #[test]
+    fn kimi_step_error_is_one_visible_message_and_keeps_failed_turn() {
+        let agent = kimi_agent(Path::new("/tmp/kota-kimi-agent"));
+        let source = kimi_source(Path::new("/tmp/kimi-wire.jsonl"));
+        // Real quota-failure sequence from CLI 2.0.2, with identifiers scrubbed.
+        let message = "[provider.auth_error] 403 You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota";
+        let records = [
+            serde_json::json!({
+                "type": "context.append_loop_event", "agentId": "main",
+                "event": {"type": "step.end", "uuid": "step_x", "turnId": "23", "step": 1, "finishReason": "error"},
+                "time": 1789973485072i64
+            }),
+            serde_json::json!({
+                "type": "turn.step.interrupted", "agentId": "main", "turnId": 23,
+                "step": 1, "reason": "error", "message": message, "time": 1789973485081i64
+            }),
+            serde_json::json!({
+                "turnId": 23, "outcome": "failed", "errorMessage": "[object Object]",
+                "type": "agent.turn.ended", "time": 1789973485072i64, "kind": "event"
+            }),
+            serde_json::json!({
+                "type": "turn.ended", "agentId": "main", "turnId": 23, "reason": "failed",
+                "error": {
+                    "code": "provider.auth_error",
+                    "message": message.strip_prefix("[provider.auth_error] ").unwrap(),
+                    "name": "APIStatusError", "retryable": false,
+                    "details": {"statusCode": 403, "requestId": null, "traceId": "trace_x"}
+                },
+                "durationMs": 1221, "traceId": "trace_x", "time": 1789973485082i64
+            }),
+            serde_json::json!({
+                "type": "token_counting.turn_recorded", "agentId": "main", "turnId": 23,
+                "length": 323, "tokens": 168394, "time": 1789973485083i64
+            }),
+            serde_json::json!({
+                "type": "prompt.completed", "agentId": "main", "promptId": "msg_x",
+                "finishedAt": "2026-09-21T06:51:25.083Z", "reason": "failed", "time": 1789973485083i64
+            }),
+        ];
+        let events = records
+            .into_iter()
+            .enumerate()
+            .flat_map(|(index, record)| parse_kimi_line(&agent, &source, 1752 + index, record))
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            assert_eq!(event.work_signal.as_deref(), Some("failed"));
+            assert_eq!(event.stop_reason.as_deref(), Some("error"));
+            assert_eq!(event.turn_id.as_deref(), Some("23"));
+            assert_eq!(native_work_event(event).unwrap().state, "failed");
+        }
+        assert!(room_event_for(&events[0], Path::new("/tmp/kota")).is_none());
+        let (room, shared) = split_for_violet_outputs(events, Path::new("/tmp/kota"));
+        assert_eq!(room.len(), 1);
+        assert_eq!(shared.len(), 1);
+        assert_eq!(room[0].role, "assistant");
+        assert_eq!(room[0].kind, "message");
+        assert_eq!(room[0].text, format!("Kimi Code error: {message}"));
+        assert_eq!(shared[0].text, room[0].text);
+        assert_eq!(shared[0].kind, "message");
+        assert_eq!(native_work_event(&room[0]).unwrap().state, "failed");
+
+        // The same real quota failure in the next turn is its own message.
+        let next_record = serde_json::json!({
+            "type": "turn.step.interrupted", "agentId": "main", "turnId": 24,
+            "step": 1, "reason": "error", "message": message, "time": 1789974001567i64
+        });
+        let next = parse_kimi_line(&agent, &source, 1765, next_record.clone());
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].kind, "message");
+        assert_eq!(next[0].turn_id.as_deref(), Some("24"));
+        assert_eq!(native_work_event(&next[0]).unwrap().state, "failed");
+        assert_ne!(next[0].native_event_id, room[0].native_event_id);
+        assert_ne!(
+            event_to_message(next[0].clone()).id,
+            event_to_message(room[0].clone()).id
+        );
+        let rescanned = parse_kimi_line(&agent, &source, 1765, next_record);
+        assert_eq!(rescanned[0].native_event_id, next[0].native_event_id);
+        assert_eq!(
+            event_to_message(rescanned[0].clone()).id,
+            event_to_message(next[0].clone()).id
+        );
+    }
+
+    #[test]
+    fn kimi_step_error_without_message_keeps_hidden_failure() {
+        let agent = kimi_agent(Path::new("/tmp/kota-kimi-agent"));
+        let source = kimi_source(Path::new("/tmp/kimi-wire.jsonl"));
+        for message in [
+            None,
+            Some(serde_json::json!(null)),
+            Some(serde_json::json!("")),
+            Some(serde_json::json!(" \n ")),
+            Some(serde_json::json!(403)),
+        ] {
+            let mut record = serde_json::json!({
+                "type": "turn.step.interrupted", "turnId": "23", "step": 1,
+                "reason": "error", "time": 1789973485081i64
+            });
+            if let Some(message) = message {
+                record["message"] = message;
+            }
+            let events = parse_kimi_line(&agent, &source, 1753, record);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].kind, "control");
+            assert_eq!(events[0].stop_reason.as_deref(), Some("error"));
+            assert_eq!(events[0].turn_id.as_deref(), Some("23"));
+            assert_eq!(native_work_event(&events[0]).unwrap().state, "failed");
+            let (room, shared) = split_for_violet_outputs(events, Path::new("/tmp/kota"));
+            assert!(room.is_empty());
+            assert!(shared.is_empty());
+        }
+    }
+
+    #[test]
+    fn kimi_non_error_step_interruptions_keep_canary_without_failing() {
+        let agent = kimi_agent(Path::new("/tmp/kota-kimi-agent"));
+        let source = kimi_source(Path::new("/tmp/kimi-wire.jsonl"));
+        let canary = kimi_unknown_event(&agent, &source, "t", "record", "turn.step.interrupted");
+        for reason in [
+            None,
+            Some("cancelled"),
+            Some("interrupted"),
+            Some("future_reason"),
+        ] {
+            let record = serde_json::json!({
+                "type": "turn.step.interrupted", "turnId": 23, "step": 1,
+                "reason": reason, "message": "unclassified details", "time": 1789973485081i64
+            });
+            let events = parse_kimi_line(&agent, &source, 1753, record);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].text, KIMI_UNKNOWN_EVENT_WARNING);
+            assert_eq!(events[0].native_event_id, canary.native_event_id);
+            assert!(native_work_event(&events[0]).is_none());
+        }
+
+        let cancelled = parse_kimi_line(
+            &agent,
+            &source,
+            1754,
+            serde_json::json!({
+                "type": "turn.cancel", "turnId": "23", "time": 1789973485082i64
+            }),
+        );
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(native_work_event(&cancelled[0]).unwrap().state, "interrupted");
+        assert!(room_event_for(&cancelled[0], Path::new("/tmp/kota")).is_none());
+    }
+
+    #[test]
     fn locate_kimi_source_uses_matching_workspace_main_wire_only() {
         let root = temp_violet_dir("kimi-locator");
         let kimi_home = root.join("kimi-home");
@@ -9897,6 +10458,16 @@ mod tests {
         assert_eq!(source.session_id, "session_kimi");
         assert_eq!(source.path, main_wire);
         assert_ne!(source.path, child_wire);
+
+        fs::write(
+            session_dir.join("state.json"),
+            serde_json::json!({"cwd": path_string(&cwd)}).to_string(),
+        )
+        .unwrap();
+        let source = locate_kimi_source_in(&kimi_home, &kimi_agent(&cwd))
+            .unwrap()
+            .expect("Kimi main source with current cwd field");
+        assert_eq!(source.path, main_wire);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -9971,6 +10542,8 @@ mod tests {
 
     fn native_event(role: &str, kind: &str, text: &str) -> NativeEvent {
         NativeEvent {
+            shell_handoff: None,
+            handoff_bus_id: None,
             session_id: "s".into(),
             agent_id: "alice".into(),
             shell: "codex".into(),
@@ -10711,6 +11284,147 @@ mod tests {
         );
         assert!(room_event_for(&event, Path::new("/tmp/kota")).is_none());
         assert_eq!(native_work_event(&event).unwrap().state, "idle");
+    }
+
+    #[test]
+    fn opencode_native_fixture_classifies_tool_preamble_as_commentary() {
+        let fixture: JsonValue =
+            serde_json::from_str(include_str!("fixtures/opencode-tool-progress.json")).unwrap();
+        assert_eq!(
+            json_string(&fixture, &["session"]).as_deref(),
+            Some("ses_f3f9fdcb6ffeVSVCuPXhLaS2AG")
+        );
+
+        let assistant_messages = fixture["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| json_string(message, &["role"]).as_deref() == Some("assistant"))
+            .collect::<Vec<_>>();
+        let mut assistant_steps = Vec::new();
+        let mut current_step = None::<Vec<&JsonValue>>;
+        for part in fixture["parts"].as_array().unwrap() {
+            match json_string(part, &["type"]).as_deref() {
+                Some("step-start") => {
+                    assert!(current_step.is_none());
+                    current_step = Some(vec![part]);
+                }
+                Some("step-finish") => {
+                    let mut step = current_step.take().unwrap();
+                    step.push(part);
+                    assistant_steps.push(step);
+                }
+                _ => {
+                    if let Some(step) = current_step.as_mut() {
+                        step.push(part);
+                    }
+                }
+            }
+        }
+        assert!(current_step.is_none());
+        assert_eq!(assistant_messages.len(), assistant_steps.len());
+
+        let classified_steps = assistant_messages
+            .into_iter()
+            .zip(assistant_steps)
+            .map(|(message, raw_parts)| {
+                let role = json_string(message, &["role"]).unwrap();
+                let mut parts = raw_parts
+                    .into_iter()
+                    .filter_map(opencode_part_event)
+                    .collect::<Vec<_>>();
+                classify_opencode_message_parts(&role, message, &mut parts);
+                parts
+            })
+            .collect::<Vec<_>>();
+        let text_parts = classified_steps
+            .iter()
+            .flat_map(|step| step.iter())
+            .filter(|part| part.part_type == "text")
+            .map(|part| (part.text.as_str(), part.kind.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            text_parts,
+            vec![
+                ("OC_FIRST_OK", "message"),
+                ("OC_PROGRESS_2", "commentary"),
+                ("OC_END_2", "message"),
+            ]
+        );
+        assert!(classified_steps[1]
+            .iter()
+            .any(|part| part.part_type == "reasoning" && part.kind == "thinking"));
+        assert!(classified_steps[1]
+            .iter()
+            .any(|part| part.part_type == "tool" && part.kind == "tool"));
+    }
+
+    #[test]
+    fn opencode_text_classification_uses_completed_message_finish() {
+        let classify_text = |role: &str, message: JsonValue, raw_parts: Vec<JsonValue>| {
+            let mut parts = raw_parts
+                .iter()
+                .filter_map(opencode_part_event)
+                .collect::<Vec<_>>();
+            classify_opencode_message_parts(role, &message, &mut parts);
+            parts
+                .into_iter()
+                .find(|part| part.part_type == "text")
+                .unwrap()
+                .kind
+        };
+        let text = || serde_json::json!({"type":"text","text":"same body"});
+        let tool = || {
+            serde_json::json!({
+                "type":"tool",
+                "state":{"status":"running","output":"/tmp/kota"}
+            })
+        };
+
+        assert_eq!(
+            classify_text("assistant", serde_json::json!({}), vec![text()]),
+            "message"
+        );
+        assert_eq!(
+            classify_text(
+                "assistant",
+                serde_json::json!({"finish":"tool-calls"}),
+                vec![text()]
+            ),
+            "commentary"
+        );
+        assert_eq!(
+            classify_text("assistant", serde_json::json!({}), vec![text(), tool()]),
+            "message"
+        );
+        assert_eq!(
+            classify_text(
+                "assistant",
+                serde_json::json!({"finish":"stop"}),
+                vec![text(), tool()]
+            ),
+            "message"
+        );
+        assert_eq!(
+            classify_text(
+                "user",
+                serde_json::json!({"finish":"tool-calls"}),
+                vec![text(), tool()]
+            ),
+            "message"
+        );
+        assert_eq!(
+            classify_text(
+                "assistant",
+                serde_json::json!({}),
+                vec![
+                    text(),
+                    serde_json::json!({"type":"step-finish","reason":"tool-calls"}),
+                ]
+            ),
+            "message"
+        );
     }
 
     #[test]
@@ -11616,6 +12330,12 @@ done"#;
             aux_path: None,
         };
 
+        // A binding must refer to a source that actually exists and passes the
+        // reset cutoff. Keep the missing-source refusal before the positive case.
+        let before = fs::read(cwd.join("agent.yaml")).unwrap();
+        write_agent_session_binding(&agent, &source).unwrap();
+        assert_eq!(fs::read(cwd.join("agent.yaml")).unwrap(), before);
+        fs::write(&source.path, "{}\n").unwrap();
         write_agent_session_binding(&agent, &source).unwrap();
 
         let yaml = fs::read_to_string(cwd.join("agent.yaml")).unwrap();
@@ -13129,6 +13849,8 @@ done"#;
     #[test]
     fn bootstrap_filter_drops_codex_setup_events() {
         let task_started = NativeEvent {
+            shell_handoff: None,
+            handoff_bus_id: None,
             session_id: "s".into(),
             agent_id: "alice".into(),
             shell: "codex".into(),
@@ -13831,6 +14553,114 @@ done"#;
         fs::remove_dir_all(root).unwrap();
     }
 
+    fn opencode_progress_snapshots() -> (JsonValue, JsonValue, Vec<(String, JsonValue)>) {
+        let fixture: JsonValue =
+            serde_json::from_str(include_str!("fixtures/opencode-tool-progress.json")).unwrap();
+        let mut completed_message = fixture["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| json_string(message, &["finish"]).as_deref() == Some("tool-calls"))
+            .unwrap()
+            .clone();
+        completed_message["id"] = JsonValue::String("msg_0c0613cb1001SyLpKBiUkqa31N".into());
+
+        let fixture_parts = fixture["parts"].as_array().unwrap();
+        let reasoning = fixture_parts
+            .iter()
+            .find(|part| {
+                json_string(part, &["type"]).as_deref() == Some("reasoning")
+                    && json_string(part, &["text"])
+                        .is_some_and(|text| text.contains("OC_PROGRESS_2"))
+            })
+            .unwrap()
+            .clone();
+        let text = fixture_parts
+            .iter()
+            .find(|part| json_string(part, &["text"]).as_deref() == Some("OC_PROGRESS_2"))
+            .unwrap()
+            .clone();
+        let tool = fixture_parts
+            .iter()
+            .find(|part| {
+                json_string(part, &["type"]).as_deref() == Some("tool")
+                    && json_string(part, &["state", "input", "command"]).as_deref()
+                        == Some("sleep 3; pwd")
+            })
+            .unwrap()
+            .clone();
+
+        let mut incomplete_message = completed_message.clone();
+        incomplete_message.as_object_mut().unwrap().remove("finish");
+        incomplete_message["time"]
+            .as_object_mut()
+            .unwrap()
+            .remove("completed");
+
+        (
+            incomplete_message,
+            completed_message,
+            vec![
+                ("prt_01_reasoning".into(), reasoning),
+                ("prt_02_text".into(), text),
+                ("prt_03_tool".into(), tool),
+            ],
+        )
+    }
+
+    fn assert_opencode_progress_transition(
+        incomplete_events: Vec<NativeEvent>,
+        completed_events: Vec<NativeEvent>,
+    ) {
+        assert_eq!(incomplete_events.len(), 2);
+        assert_eq!(completed_events.len(), 3);
+        assert!(!incomplete_events
+            .iter()
+            .any(|event| event.text == "OC_PROGRESS_2"));
+
+        let created_timestamp = millis_to_iso(1789933993137).unwrap();
+        for kind in ["thinking", "tool"] {
+            let incomplete = incomplete_events
+                .iter()
+                .find(|event| event.kind == kind)
+                .unwrap();
+            let completed = completed_events
+                .iter()
+                .find(|event| event.kind == kind)
+                .unwrap();
+            assert_eq!(incomplete.timestamp, created_timestamp);
+            assert_eq!(completed.timestamp, created_timestamp);
+            assert_eq!(incomplete.native_event_id, completed.native_event_id);
+            assert_eq!(
+                event_to_message(incomplete.clone()).id,
+                event_to_message(completed.clone()).id
+            );
+        }
+
+        let text = completed_events
+            .iter()
+            .find(|event| event.text == "OC_PROGRESS_2")
+            .unwrap();
+        assert_eq!(text.kind, "commentary");
+        assert_eq!(text.timestamp, created_timestamp);
+    }
+
+    #[test]
+    fn opencode_timestamp_prefers_created_and_falls_back_to_completed() {
+        assert_eq!(
+            opencode_timestamp(&serde_json::json!({
+                "time": {"created": 1770000000100_i64, "completed": 1770000000200_i64}
+            })),
+            millis_to_iso(1770000000100)
+        );
+        assert_eq!(
+            opencode_timestamp(&serde_json::json!({
+                "time": {"completed": 1770000000200_i64}
+            })),
+            millis_to_iso(1770000000200)
+        );
+    }
+
     #[test]
     fn parse_opencode_sqlite_reads_text_parts() {
         let root = temp_violet_dir("opencode-sqlite");
@@ -13875,7 +14705,7 @@ done"#;
                 "ses_test",
                 1770000000100_i64,
                 1770000000100_i64,
-                r#"{"role":"assistant","time":{"created":1770000000100}}"#
+                r#"{"role":"assistant","time":{"created":1770000000100,"completed":1770000000200},"finish":"stop"}"#
             ],
         )
         .unwrap();
@@ -13925,6 +14755,140 @@ done"#;
         assert_eq!(events[0].text, "list cwd");
         assert_eq!(events[1].role, "assistant");
         assert_eq!(events[1].text, "found App.tsx");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parse_opencode_sqlite_keeps_part_ids_stable_across_completion() {
+        let (incomplete_message, completed_message, parts) = opencode_progress_snapshots();
+        let root = temp_violet_dir("opencode-finished-text");
+        fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            create table message (
+                id text primary key,
+                session_id text,
+                time_created integer,
+                time_updated integer,
+                data text
+            );
+            create table part (
+                id text primary key,
+                session_id text,
+                message_id text,
+                time_created integer,
+                time_updated integer,
+                data text
+            );
+            ",
+        )
+        .unwrap();
+        let message_id = "msg_0c0613cb1001SyLpKBiUkqa31N";
+        conn.execute(
+            "insert into message (id, session_id, time_created, time_updated, data) values (?1, ?2, ?3, ?4, ?5)",
+            params![
+                message_id,
+                "ses_f3f9fdcb6ffeVSVCuPXhLaS2AG",
+                1789933993137_i64,
+                1789933993137_i64,
+                serde_json::to_string(&incomplete_message).unwrap()
+            ],
+        )
+        .unwrap();
+        for (index, (part_id, part)) in parts.iter().enumerate() {
+            let part_millis = 1789934009408_i64 + index as i64;
+            conn.execute(
+                "insert into part (id, session_id, message_id, time_created, time_updated, data) values (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    part_id,
+                    "ses_f3f9fdcb6ffeVSVCuPXhLaS2AG",
+                    message_id,
+                    part_millis,
+                    part_millis,
+                    serde_json::to_string(part).unwrap()
+                ],
+            )
+            .unwrap();
+        }
+
+        let agent = ProjectAgent {
+            agent_id: "agent-opencode".into(),
+            shell: "opencode".into(),
+            cwd: root.clone(),
+            session_id: Some("ses_f3f9fdcb6ffeVSVCuPXhLaS2AG".into()),
+        };
+        let source = NativeSource {
+            kind: "opencode-sqlite".into(),
+            session_id: "ses_f3f9fdcb6ffeVSVCuPXhLaS2AG".into(),
+            path: db_path,
+            aux_path: None,
+        };
+
+        let incomplete_events = parse_opencode_sqlite(&agent, &source).unwrap();
+
+        conn.execute(
+            "update message set time_updated = ?1, data = ?2 where id = ?3",
+            params![
+                1789934020416_i64,
+                serde_json::to_string(&completed_message).unwrap(),
+                message_id
+            ],
+        )
+        .unwrap();
+        let completed_events = parse_opencode_sqlite(&agent, &source).unwrap();
+
+        assert_opencode_progress_transition(incomplete_events, completed_events);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parse_opencode_message_dir_keeps_part_ids_stable_across_completion() {
+        let (incomplete_message, completed_message, parts) = opencode_progress_snapshots();
+        let root = temp_violet_dir("opencode-message-dir-finished-text");
+        let message_root = root.join("message");
+        let part_root = root.join("part");
+        let message_id = "msg_0c0613cb1001SyLpKBiUkqa31N";
+        let message_path = message_root.join(format!("{message_id}.json"));
+        let part_dir = part_root.join(message_id);
+        fs::create_dir_all(&message_root).unwrap();
+        fs::create_dir_all(&part_dir).unwrap();
+        fs::write(
+            &message_path,
+            serde_json::to_string(&incomplete_message).unwrap(),
+        )
+        .unwrap();
+        for (part_id, part) in &parts {
+            fs::write(
+                part_dir.join(format!("{part_id}.json")),
+                serde_json::to_string(part).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let agent = ProjectAgent {
+            agent_id: "agent-opencode".into(),
+            shell: "opencode".into(),
+            cwd: root.clone(),
+            session_id: Some("ses_f3f9fdcb6ffeVSVCuPXhLaS2AG".into()),
+        };
+        let source = NativeSource {
+            kind: "opencode-message-dir".into(),
+            session_id: "ses_f3f9fdcb6ffeVSVCuPXhLaS2AG".into(),
+            path: message_root,
+            aux_path: Some(part_root),
+        };
+
+        let incomplete_events = parse_opencode_message_dir(&agent, &source).unwrap();
+        fs::write(
+            message_path,
+            serde_json::to_string(&completed_message).unwrap(),
+        )
+        .unwrap();
+        let completed_events = parse_opencode_message_dir(&agent, &source).unwrap();
+
+        assert_opencode_progress_transition(incomplete_events, completed_events);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -14180,3 +15144,9 @@ done"#;
         assert!(is_private_event(&event, &spans));
     }
 }
+
+#[cfg(test)]
+mod shell_switch_tests;
+
+#[cfg(test)]
+mod claude_paste_tests;

@@ -1676,6 +1676,7 @@ export interface TavernIncarnateHeroRequest {
   agentId: string;
   templateId: string;
   displayName: string;
+  nameFields?: ProjectAgentNameFieldsPayload | null;
   projectRoot?: string | null;
   progressId?: string | null;
   profile: TavernHeroProfileDraft;
@@ -1769,6 +1770,7 @@ export interface ProjectAgentIdentityListing {
 }
 
 export interface ProjectAgentSaveRequest extends ProjectAgentRequest {
+  provider?: string;
   displayName: string;
   nameFields?: ProjectAgentNameFieldsPayload | null;
   model: string;
@@ -1791,7 +1793,6 @@ export interface ProjectAgentLifecycleResult {
 
 export interface ProjectAgentInviteRequest extends ProjectAgentRequest {
   displayName?: string | null;
-  forceDuplicate?: boolean;
 }
 
 export interface ProjectAgentInviteResult {
@@ -3629,6 +3630,7 @@ export async function startFreshProjectAgentSession(
         adapterPath: detail.adapterPath,
         args: detail.args,
         sessionId: null,
+        freshSession: true,
       },
     };
   }
@@ -3823,10 +3825,10 @@ function mockProjectAgentDetail(
     sourceHeroName: baseName.split(' v. ')[0] || baseName,
     projectId: 'mock-project',
     projectName: 'MockProject',
-    cli: 'codex',
-    provider: 'codex',
+    cli: (patch?.provider ?? 'codex') as AgentSpawnRequest['cli'],
+    provider: patch?.provider ?? 'codex',
     model: patch?.model || 'gpt-5.5',
-    effort: patch?.effort || 'xhigh',
+    effort: patch?.effort !== undefined ? patch.effort : 'xhigh',
     avatarId: patch?.avatarId || 'codex',
     skills: patch?.skills || ['frontend-design', 'test-app'],
     args: ['--model', patch?.model || 'gpt-5.5'],

@@ -73,6 +73,7 @@ function mockDetail(detail = projectDetail()) {
   return vi.spyOn(ptyClient, 'saveProjectAgentDetail')
     .mockImplementation(async (request) => ({
       ...detail,
+      provider: request.provider ?? detail.provider,
       model: request.model,
       effort: request.effort,
       avatarId: request.avatarId,
@@ -87,7 +88,7 @@ describe('Project agent custom SHELL values', () => {
       renderOverlay();
       const shell = await screen.findByRole('region', { name: 'SHELL' });
       await userEvent.click(within(shell).getByRole('button', { name: 'Edit SHELL' }));
-      const [modelInput, effortInput] = within(shell).getAllByRole('combobox');
+      const [modelInput, effortInput] = within(shell).getAllByRole('combobox').filter((element) => element.getAttribute('aria-label') !== 'Provider');
 
       await userEvent.clear(modelInput);
       await userEvent.type(modelInput, 'private-model');
@@ -116,7 +117,7 @@ describe('Project agent custom SHELL values', () => {
       renderOverlay();
       const shell = await screen.findByRole('region', { name: 'SHELL' });
       await userEvent.click(within(shell).getByRole('button', { name: 'Edit SHELL' }));
-      const modelInput = within(shell).getAllByRole('combobox')[0];
+      const modelInput = within(shell).getAllByRole('combobox').filter((element) => element.getAttribute('aria-label') !== 'Provider')[0];
       await userEvent.clear(modelInput);
       await userEvent.type(modelInput, 'half-written-model');
 
@@ -158,7 +159,7 @@ describe('Project agent custom SHELL values', () => {
       renderOverlay();
       const shell = await screen.findByRole('region', { name: 'SHELL' });
       await userEvent.click(within(shell).getByRole('button', { name: 'Edit SHELL' }));
-      const modelInput = within(shell).getAllByRole('combobox')[0];
+      const modelInput = within(shell).getAllByRole('combobox').filter((element) => element.getAttribute('aria-label') !== 'Provider')[0];
       await userEvent.clear(modelInput);
 
       expect(within(shell).queryByRole('option', { name: /stale-probe-model/i })).toBeNull();
@@ -166,5 +167,53 @@ describe('Project agent custom SHELL values', () => {
       vi.restoreAllMocks();
       if (originalStorage) Object.defineProperty(window, 'localStorage', originalStorage);
     }
+  });
+});
+
+
+describe('Project agent provider target', () => {
+  it('stages provider changes, restores A when edited back, and saves only the final target without launching', async () => {
+    const saveShell = mockDetail();
+    const start = vi.spyOn(ptyClient, 'startFreshProjectAgentSession');
+    const spawn = vi.spyOn(ptyClient, 'spawnAgentPty');
+    try {
+      renderOverlay();
+      const shell = await screen.findByRole('region', { name: 'SHELL' });
+      await userEvent.click(within(shell).getByRole('button', { name: 'Edit SHELL' }));
+      const provider = within(shell).getByRole('combobox', { name: 'Provider' });
+      const model = within(shell).getByPlaceholderText('Exact model ID');
+      await userEvent.selectOptions(provider, 'claude');
+      expect(model).toHaveValue('default');
+      await userEvent.selectOptions(provider, 'codex');
+      expect(model).toHaveValue('provider-model');
+      await userEvent.selectOptions(provider, 'claude');
+      await userEvent.selectOptions(provider, 'kimi');
+      expect(saveShell).not.toHaveBeenCalled();
+      await userEvent.click(within(shell).getByRole('button', { name: 'Save SHELL' }));
+      await waitFor(() => expect(saveShell).toHaveBeenCalledTimes(1));
+      expect(saveShell.mock.calls[0][0]).toMatchObject({ provider: 'kimi', model: 'default', effort: null, projectRoot: '/tmp/custom-project', agentId: 'agent-custom' });
+      expect(start).not.toHaveBeenCalled(); expect(spawn).not.toHaveBeenCalled();
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+      await userEvent.click(within(shell).getByRole('button', { name: 'Edit SHELL' }));
+      expect(within(shell).getByRole('combobox', { name: 'Provider' })).toHaveValue('kimi');
+    } finally { vi.restoreAllMocks(); }
+  });
+
+  it('keeps the failed provider draft editable and does not issue concurrent saves', async () => {
+    const saveShell = mockDetail();
+    let fail!: (error: Error) => void;
+    saveShell.mockImplementation(() => new Promise((_, reject) => { fail = reject; }));
+    try {
+      renderOverlay();
+      const shell = await screen.findByRole('region', { name: 'SHELL' });
+      await userEvent.click(within(shell).getByRole('button', { name: 'Edit SHELL' }));
+      await userEvent.selectOptions(within(shell).getByRole('combobox', { name: 'Provider' }), 'claude');
+      await userEvent.dblClick(within(shell).getByRole('button', { name: 'Save SHELL' }));
+      expect(saveShell).toHaveBeenCalledTimes(1);
+      fail(new Error('write failed'));
+      await screen.findByText('Error: write failed');
+      expect(within(shell).getByRole('combobox', { name: 'Provider' })).toHaveValue('claude');
+      expect(within(shell).getByRole('button', { name: 'Save SHELL' })).toBeEnabled();
+    } finally { vi.restoreAllMocks(); }
   });
 });

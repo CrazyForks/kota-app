@@ -4672,6 +4672,79 @@ describe('Tavern · storage measurement', () => {
 });
 
 describe('M6.A · quick incarnate picker', () => {
+  it('offers a newly invited hero on the first recruit opening in another project without opening Tavern', async () => {
+    const source = hydrationWorkspace('invite-source', ['agent-piner']);
+    const target = hydrationWorkspace('invite-target', []);
+    const storage = withMockLocalStorage();
+    const profile: ptyClient.TavernHeroProfileDraft = {
+      heroId: 'hero-invited-piner', name: '颦儿 v. Kota', kind: 'invited',
+      provider: 'codex', model: 'default', skills: [], ghost: 'Personal ghost', shell: '',
+    };
+    const existing = { ...profile, heroId: 'hero-invited-hengwu', name: '蘅芜君' };
+    const archived = { ...profile, heroId: 'hero-invited-archived', name: 'Archived', archived: true };
+    const dismissed = { ...profile, heroId: 'hero-invited-dismissed', name: 'Dismissed', dismissed: true };
+    let savedProfiles = [existing, archived, dismissed];
+    vi.spyOn(ptyClient, 'hasTauriRuntime').mockReturnValue(true);
+    vi.spyOn(ptyClient, 'workspaceStatus').mockResolvedValue({ active: source });
+    vi.spyOn(ptyClient, 'listWorkspaceProjects').mockResolvedValue([source, target]);
+    vi.spyOn(ptyClient, 'openWorkspaceProject').mockResolvedValue(target);
+    vi.spyOn(ptyClient, 'loadProjectAgentLayoutFile').mockResolvedValue(null);
+    vi.spyOn(ptyClient, 'saveProjectAgentLayoutFile').mockResolvedValue();
+    vi.spyOn(ptyClient, 'inspectProjectAgentIdentities').mockImplementation(async (root) => ({
+      identities: root === source.localRoot ? [hydrationIdentity('agent-piner', '颦儿')] : [],
+      workspaceEntryCount: root === source.localRoot ? 1 : 0,
+    }));
+    vi.spyOn(ptyClient, 'loadProjectAgentDetail').mockResolvedValue({
+      ...hydrationDetail('agent-piner', source.localRoot, '颦儿'),
+      inviteEligibility: {
+        eligible: true, proposedHeroId: profile.heroId, proposedDisplayName: profile.name,
+      },
+    });
+    const profiles = vi.spyOn(ptyClient, 'loadTavernHeroProfiles').mockImplementation(async () => savedProfiles);
+    const invite = vi.spyOn(ptyClient, 'inviteProjectAgentToTavern').mockImplementation(async () => {
+      savedProfiles = [...savedProfiles, profile];
+      return { heroId: profile.heroId, displayName: profile.name, path: `/fixture/heroes/${profile.heroId}` };
+    });
+    const spawn = vi.spyOn(ptyClient, 'spawnAgentPty');
+    const recruit = vi.spyOn(ptyClient, 'incarnateTavernHero');
+    const write = vi.spyOn(ptyClient, 'writeAgentPty');
+    const view = render(<App />);
+    try {
+      await screen.findByTestId('chip-agent-piner');
+      await waitFor(() => expect(view.container.querySelector('.stage')).not.toHaveAttribute('aria-busy'));
+      await waitFor(() => expect(profiles).toHaveBeenCalledTimes(1));
+      expect(storage.storage.get('kota-v2.tavern.custom-heroes')).not.toContain(profile.heroId);
+      fireEvent.contextMenu(screen.getByTestId('chip-agent-piner'));
+      await userEvent.click(within(screen.getByRole('menu')).getByText('Detail'));
+      const detail = await screen.findByRole('dialog', { name: 'Project agent detail' });
+      const button = within(detail).getByRole('button', { name: 'Invite to Tavern' });
+      await waitFor(() => expect(button).toBeEnabled());
+      await userEvent.click(button);
+      await waitFor(() => expect(within(detail).getByRole('button', { name: 'Already in Tavern' })).toBeDisabled());
+      await userEvent.click(within(detail).getByRole('button', { name: 'Back' }));
+      await userEvent.click(screen.getByTestId(`tab-${target.projectId}`));
+      await waitFor(() => {
+        expect(screen.getByTestId(`tab-${target.projectId}`)).toHaveAttribute('aria-selected', 'true');
+        expect(view.container.querySelector('.stage')).not.toHaveAttribute('aria-busy');
+      });
+      await userEvent.click(screen.getByTestId('ribbon-add'));
+      expect(await screen.findByTestId(`incarnate-shortcut-${profile.heroId}`)).toBeEnabled();
+      expect(screen.getByTestId(`incarnate-shortcut-${existing.heroId}`)).toBeEnabled();
+      expect(screen.queryByTestId(`incarnate-shortcut-${archived.heroId}`)).not.toBeInTheDocument();
+      expect(screen.queryByTestId(`incarnate-shortcut-${dismissed.heroId}`)).not.toBeInTheDocument();
+      expect(screen.queryByTestId('tavern-page')).not.toBeInTheDocument();
+      expect(profiles).toHaveBeenCalledTimes(2);
+      // An active workspace is resolved by the backend; App deliberately passes null.
+      expect(invite).toHaveBeenCalledExactlyOnceWith({ agentId: 'agent-piner', projectRoot: null });
+      expect(spawn).not.toHaveBeenCalled();
+      expect(recruit).not.toHaveBeenCalled();
+      expect(write).not.toHaveBeenCalled();
+    } finally {
+      view.unmount();
+      storage.restore();
+    }
+  });
+
   it('uses the topbar Tavern control as a project back button while Tavern is open', async () => {
     render(<App />);
     await userEvent.click(screen.getByTestId('tavern-btn'));
@@ -4942,6 +5015,7 @@ describe('M2 · hearth centerpiece', () => {
     for (const key of [
       'kota-v2.layout-mode',
       'kota-v2.centerpiece',
+      'kota-v2.project-appearance.kota.kota-v2.centerpiece',
       'kota-v2.room-color',
       'kota-v2.desk-color',
     ]) {
@@ -5310,6 +5384,7 @@ describe('P3 · workspace file tree', () => {
     const seat = screen.getByTestId('seat-alice');
     expect(chip).not.toHaveClass('file-tree-hover');
     expect(seat).not.toHaveClass('file-tree-hover');
+    expect(seat).toHaveAttribute('title', 'CC');
 
     act(() => emitFileTreeAgentHover('alice' as AgentId, true));
     await waitFor(() => {
@@ -5571,6 +5646,7 @@ describe('P3 · workspace file tree', () => {
     expect(chip).toHaveTextContent('Unsupported');
     expect(seat).toHaveClass('unsupported');
     expect(seat).toHaveAttribute('aria-disabled', 'true');
+    expect(seat).toHaveAttribute('title', 'Alice · Unsupported provider: future-cli');
     expect(seat).toHaveTextContent('Unsupported · future-cli');
 
     fireEvent.click(chip);
@@ -5879,6 +5955,207 @@ describe('MT · Smart Terminal multi-tab', () => {
   });
 });
 
+describe('Project archive room restoration', () => {
+  // Exercise the real App, runtime and terminal windows. Only the workspace/
+  // PTY boundary is stubbed; no real project, process or filesystem is touched.
+  function mountWorkspaces(projects: ptyClient.WorkspaceProject[]) {
+    const storage = withMockLocalStorage({
+      'kota-v2.workspace-tab-order.v1': JSON.stringify(projects.map((project) => project.projectId)),
+    });
+    vi.spyOn(ptyClient, 'hasTauriRuntime').mockReturnValue(true);
+    vi.spyOn(ptyClient, 'workspaceStatus').mockResolvedValue({ active: projects[0]! });
+    vi.spyOn(ptyClient, 'listWorkspaceProjects').mockResolvedValue(projects);
+    vi.spyOn(ptyClient, 'loadProjectAgentLayoutFile').mockResolvedValue(null);
+    vi.spyOn(ptyClient, 'saveProjectAgentLayoutFile').mockResolvedValue();
+    vi.spyOn(ptyClient, 'inspectProjectAgentIdentities').mockImplementation(async (root) => {
+      const agents = projects.find((project) => project.localRoot === root)?.agents ?? [];
+      return {
+        identities: agents.map((agent) => hydrationIdentity(agent.agentId)),
+        workspaceEntryCount: agents.length,
+      };
+    });
+    vi.spyOn(ptyClient, 'loadProjectAgentDetail').mockImplementation(async ({ agentId }) => {
+      const project = projects.find((item) => item.agents.some((agent) => agent.agentId === agentId))!;
+      return hydrationDetail(agentId, project.localRoot);
+    });
+    vi.spyOn(ptyClient, 'resolveProjectAgentLaunch').mockImplementation(async ({ agentId }) => ({
+      status: 'ready',
+      request: {
+        ...projects.flatMap((project) => project.agents).find((agent) => agent.agentId === agentId)!,
+        cli: 'codex',
+      },
+    }));
+    const open = vi.spyOn(ptyClient, 'openWorkspaceProject').mockImplementation(async (projectId) => (
+      projects.find((project) => project.projectId === projectId)!
+    ));
+    const inspect = vi.spyOn(ptyClient, 'inspectWorkspaceProject')
+      .mockResolvedValue({ dirty: false, dirtySummary: '' });
+    const archive = vi.spyOn(ptyClient, 'archiveWorkspaceProject')
+      .mockResolvedValue({ ok: true, dirty: false, dirtySummary: '', project: null });
+    // These use pty-client's browser stubs, while useAgentRuntime itself is real.
+    const spawn = vi.spyOn(ptyClient, 'spawnAgentPty');
+    const close = vi.spyOn(ptyClient, 'closeAgentPty');
+    const write = vi.spyOn(ptyClient, 'writeAgentPty');
+    const alert = vi.spyOn(window, 'alert').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const view = render(<App />);
+    return {
+      view, open, inspect, archive, spawn, close, write, alert,
+      cleanup: () => { view.unmount(); storage.restore(); },
+    };
+  }
+
+  async function selectProject(projectId: string) {
+    await userEvent.click(await screen.findByTestId(`tab-${projectId}`));
+    await waitFor(() => {
+      expect(screen.getByTestId(`tab-${projectId}`)).toHaveAttribute('aria-selected', 'true');
+      expect(document.querySelector('.stage')).not.toHaveAttribute('aria-busy');
+    });
+  }
+
+  async function openTerminal(agentId: string) {
+    await screen.findByTestId(`chip-${agentId}`);
+    await waitFor(() => expect(document.querySelector('.stage')).not.toHaveAttribute('aria-busy'));
+    await userEvent.dblClick(chip(agentId));
+    await screen.findByTestId(`win-frame-${agentId}`);
+    await flushHydrationPromises();
+  }
+
+  async function minimizeTerminal(agentId: string) {
+    await userEvent.click(within(winFrame(agentId)).getByRole('button', { name: 'Minimize window' }));
+    await waitFor(() => expect(screen.queryByTestId(`win-frame-${agentId}`)).not.toBeInTheDocument());
+  }
+
+  async function archiveDialog(projectId: string) {
+    await userEvent.click(within(screen.getByTestId(`tab-${projectId}`)).getByRole('button', {
+      name: `Archive ${projectId}`,
+    }));
+    return screen.findByRole('dialog', { name: 'Archive project?' });
+  }
+
+  it.each([true, false])('restores saved terminal visibility (all minimized=%s) in the first remaining tab without respawning', async (allMinimized) => {
+    const first = hydrationWorkspace('archive-first', ['agent-first-a', 'agent-first-b']);
+    const previous = hydrationWorkspace('archive-previous', ['agent-previous']);
+    const closing = hydrationWorkspace('archive-closing', ['agent-closing', 'agent-dormant']);
+    const task = mountWorkspaces([first, previous, closing]);
+    try {
+      await openTerminal('agent-first-a');
+      await openTerminal('agent-first-b');
+      await minimizeTerminal('agent-first-a');
+      if (allMinimized) await minimizeTerminal('agent-first-b');
+      await selectProject(previous.projectId);
+      await selectProject(closing.projectId);
+      await openTerminal('agent-closing');
+      expect(task.spawn.mock.calls.map(([request]) => request.agentId))
+        .toEqual(['agent-first-a', 'agent-first-b', 'agent-closing']);
+      task.open.mockClear();
+      task.spawn.mockClear();
+
+      const dialog = await archiveDialog(closing.projectId);
+      expect(dialog).toHaveTextContent('Files stay on disk.');
+      await userEvent.click(within(dialog).getByRole('button', { name: 'Archive project' }));
+      await waitFor(() => expect(screen.getByTestId(`tab-${first.projectId}`))
+        .toHaveAttribute('aria-selected', 'true'));
+      await waitFor(() => expect(document.querySelector('.stage')).not.toHaveAttribute('aria-busy'));
+
+      expect(screen.queryByTestId(`tab-${closing.projectId}`)).not.toBeInTheDocument();
+      expect(screen.getByTestId(`tab-${previous.projectId}`)).toHaveAttribute('aria-selected', 'false');
+      expect(screen.queryByTestId('win-frame-agent-first-a')).not.toBeInTheDocument();
+      if (allMinimized) {
+        expect(screen.queryByTestId('win-frame-agent-first-b')).not.toBeInTheDocument();
+      } else {
+        expect(winFrame('agent-first-b')).toBeInTheDocument();
+      }
+      expect(screen.queryByTestId('win-frame-agent-closing')).not.toBeInTheDocument();
+      expect(task.archive).toHaveBeenCalledExactlyOnceWith({ projectId: closing.projectId, forceDirty: false });
+      expect(task.open).toHaveBeenCalledExactlyOnceWith(first.projectId);
+      expect(task.close.mock.calls).toEqual([['agent-closing'], ['agent-dormant']]);
+      expect(task.spawn).not.toHaveBeenCalled();
+      expect(task.write).not.toHaveBeenCalled();
+
+      // The hidden terminal is still live: restoring/input/minimizing it works
+      // through the existing window implementation, with no new PTY launch.
+      await openTerminal('agent-first-a');
+      fireEvent.keyDown(screen.getByLabelText(/agent-first-a.*terminal input/), { key: 'ArrowUp' });
+      await waitFor(() => expect(task.write).toHaveBeenCalledWith('agent-first-a', '\u001b[A'));
+      await minimizeTerminal('agent-first-a');
+      await selectProject(previous.projectId);
+      await selectProject(first.projectId);
+      expect(screen.queryByTestId('win-frame-agent-first-a')).not.toBeInTheDocument();
+      expect(task.spawn).not.toHaveBeenCalled();
+      expect(task.close.mock.calls).toEqual([['agent-closing'], ['agent-dormant']]);
+    } finally { task.cleanup(); }
+  });
+
+  it('archives an inactive project without changing the current room or its PTYs', async () => {
+    const first = hydrationWorkspace('archive-current', ['agent-current']);
+    const other = hydrationWorkspace('archive-other', ['agent-other']);
+    const task = mountWorkspaces([first, other]);
+    try {
+      await openTerminal('agent-current');
+      await minimizeTerminal('agent-current');
+      await selectProject(other.projectId);
+      await openTerminal('agent-other');
+      await selectProject(first.projectId);
+      task.open.mockClear();
+      task.spawn.mockClear();
+      const dialog = await archiveDialog(other.projectId);
+      await userEvent.click(within(dialog).getByRole('button', { name: 'Archive project' }));
+      await waitFor(() => expect(screen.queryByTestId(`tab-${other.projectId}`)).not.toBeInTheDocument());
+      expect(screen.getByTestId(`tab-${first.projectId}`)).toHaveAttribute('aria-selected', 'true');
+      expect(screen.queryByTestId('win-frame-agent-current')).not.toBeInTheDocument();
+      expect(task.close.mock.calls).toEqual([['agent-other']]);
+      expect(task.archive).toHaveBeenCalledExactlyOnceWith({ projectId: other.projectId, forceDirty: false });
+      expect(task.open).not.toHaveBeenCalled();
+      expect(task.spawn).not.toHaveBeenCalled();
+    } finally { task.cleanup(); }
+  });
+
+  it.each(['cancel', 'refused', 'rejected'] as const)('keeps the project and terminals unchanged when archive is %s', async (outcome) => {
+    const project = hydrationWorkspace('archive-noop', ['agent-noop']);
+    const task = mountWorkspaces([project]);
+    try {
+      await openTerminal('agent-noop');
+      if (outcome === 'refused') task.archive.mockResolvedValue({ ok: false, dirty: true, dirtySummary: 'Dirty project', project });
+      if (outcome === 'rejected') task.archive.mockRejectedValue(new Error('Archive unavailable'));
+      task.spawn.mockClear();
+      const dialog = await archiveDialog(project.projectId);
+      await userEvent.click(within(dialog).getByRole('button', {
+        name: outcome === 'cancel' ? 'Cancel' : 'Archive project',
+      }));
+      await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Archive project?' })).not.toBeInTheDocument());
+      if (outcome !== 'cancel') await waitFor(() => expect(task.alert).toHaveBeenCalledOnce());
+      expect(screen.getByTestId(`tab-${project.projectId}`)).toHaveAttribute('aria-selected', 'true');
+      expect(winFrame('agent-noop')).toBeInTheDocument();
+      expect(task.archive).toHaveBeenCalledTimes(outcome === 'cancel' ? 0 : 1);
+      expect(task.open).not.toHaveBeenCalled();
+      expect(task.close).not.toHaveBeenCalled();
+      expect(task.spawn).not.toHaveBeenCalled();
+    } finally { task.cleanup(); }
+  });
+
+  it('keeps dirty confirmation and last-project cleanup without opening any other terminal', async () => {
+    const project = hydrationWorkspace('archive-last', ['agent-last']);
+    const task = mountWorkspaces([project]);
+    try {
+      await openTerminal('agent-last');
+      task.inspect.mockResolvedValue({ dirty: true, dirtySummary: 'Uncommitted fixture.txt' });
+      task.spawn.mockClear();
+      const dialog = await archiveDialog(project.projectId);
+      expect(dialog).toHaveTextContent('Uncommitted fixture.txt');
+      expect(task.archive).not.toHaveBeenCalled();
+      await userEvent.click(within(dialog).getByRole('button', { name: 'Archive project' }));
+      await screen.findByTestId('empty-project-state');
+      expect(screen.queryByTestId(`tab-${project.projectId}`)).not.toBeInTheDocument();
+      expect(screen.queryByTestId('win-frame-agent-last')).not.toBeInTheDocument();
+      expect(task.archive).toHaveBeenCalledExactlyOnceWith({ projectId: project.projectId, forceDirty: true });
+      expect(task.close.mock.calls).toEqual([['agent-last']]);
+      expect(task.open).not.toHaveBeenCalled();
+      expect(task.spawn).not.toHaveBeenCalled();
+    } finally { task.cleanup(); }
+  });
+});
+
 describe('Project agent hydration recovery', () => {
   function mockWorkspaceBootstrap(
     active: ptyClient.WorkspaceProject,
@@ -6017,7 +6294,7 @@ describe('Project agent hydration recovery', () => {
       provider: 'claude',
       sessionId: null,
     };
-    vi.spyOn(ptyClient, 'loadProjectAgentDetail').mockResolvedValue(detail);
+    const reloadDetail = vi.spyOn(ptyClient, 'loadProjectAgentDetail').mockResolvedValue(detail);
     const resolveLaunch = vi.spyOn(ptyClient, 'resolveProjectAgentLaunch')
       .mockResolvedValue({ status: 'sessionUnavailable' });
     const startFresh = vi.spyOn(ptyClient, 'startFreshProjectAgentSession')
@@ -6027,6 +6304,7 @@ describe('Project agent hydration recovery', () => {
           ...workspace.agents[0]!,
           cli: 'claude',
           sessionId: null,
+          freshSession: true,
         },
       });
     const clearSession = vi.spyOn(ptyClient, 'clearProjectAgentSessionMetadata')
@@ -6061,10 +6339,14 @@ describe('Project agent hydration recovery', () => {
         });
         expect(spawnAgent).toHaveBeenCalledOnce();
       });
-      expect(clearSession).toHaveBeenCalledWith({
+      expect(reloadDetail).toHaveBeenCalledWith({
         agentId: 'agent-alpha',
         projectRoot: null,
       });
+      // Startup now commits provider/session/handoff together. A second clear
+      // from the UI would erase the freshly committed handoff.
+      expect(clearSession).not.toHaveBeenCalled();
+      expect(spawnAgent.mock.calls[0][0].freshSession).toBe(true);
       expect(resolveLaunch).toHaveBeenCalledTimes(2);
     } finally {
       view.unmount();
