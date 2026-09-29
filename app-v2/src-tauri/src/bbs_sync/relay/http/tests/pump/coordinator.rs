@@ -7,6 +7,7 @@ use crate::bbs_sync::{
     exchange as content,
     relay::{coordinator::Actor, discovery::Declaration, wire::Declarations},
     roster,
+    scheduler::ACTIVE_MS,
     transport::NetworkHost,
 };
 use serde::Deserialize;
@@ -295,6 +296,25 @@ async fn idle_failure_then_automatic_and_one_sided_retries_complete_without_new_
 }
 
 async fn account_scenario(restart: bool, history: usize, recovery: bool) {
+    account_fixture(restart, history, recovery, None).await;
+}
+
+// Alternating passive TLS roles; all four fixed offsets have actual TLS,
+// exchange and FileIo completion, not just a candidate-list assertion.
+#[tokio::test]
+async fn rendezvous_phase_060_real_exchange() { account_fixture(false, 0, false, Some((0, 60, false))).await; }
+#[tokio::test]
+async fn rendezvous_phase_120_real_exchange() { account_fixture(false, 0, false, Some((1, 120, false))).await; }
+#[tokio::test]
+async fn rendezvous_phase_180_real_exchange() { account_fixture(false, 0, false, Some((0, 180, false))).await; }
+#[tokio::test]
+async fn rendezvous_phase_300_real_exchange() { account_fixture(false, 0, false, Some((1, 300, false))).await; }
+#[tokio::test]
+async fn rendezvous_single_manual_client_real_exchange() { account_fixture(false, 0, false, Some((1, 300, true))).await; }
+#[tokio::test]
+async fn rendezvous_single_manual_server_real_exchange() { account_fixture(false, 0, false, Some((0, 300, true))).await; }
+
+async fn account_fixture(restart: bool, history: usize, recovery: bool, rendezvous: Option<(usize, u64, bool)>) {
     let f = fixture();
     let (_ra, sa, _) = content::tests::board(&f.contexts[0].peer.local_membership_id);
     let (_rb, sb, _) = content::tests::board(&f.contexts[1].peer.local_membership_id);
@@ -358,6 +378,7 @@ async fn account_scenario(restart: bool, history: usize, recovery: bool) {
     let changed_source=sa.clone();
     let result=host.execute(move |_|async move{
         let mut engines=Vec::new();let mut controls=Vec::new();let mut tasks=Vec::new();let mut pools=Vec::new();let mut stops=Vec::new();
+        let mut prepared = Vec::new();
         let notices:Arc<Mutex<Vec<(usize,Notice)>>>=Default::default();let work=[Arc::new(Work::default()),Arc::new(Work::default())];
         let phase_origin = Instant::now();
         let phases: Arc<Mutex<Vec<(usize, u128, &'static str)>>> = Default::default();
@@ -381,8 +402,8 @@ async fn account_scenario(restart: bool, history: usize, recovery: bool) {
             let observed_phases = phases.clone();
             let engine_slot:Arc<Mutex<Option<Arc<content::Engine>>>>=Default::default();
             let observed_engine=engine_slot.clone();let pinned=started_revisions.clone();
-            let a=Actor::new(context,store,auth.clone(),pool.bind(&auth.membership.worker_url)?,Arc::new(move|_,event|{
-                if recovery {
+            let mut a=Actor::new(context,store,auth.clone(),pool.bind(&auth.membership.worker_url)?,Arc::new(move|_,event|{
+                if recovery || rendezvous.is_some() {
                     let phase = match &event {
                         Notice::Connecting(_) => Some("connecting"),
                         Notice::Connected(_) => Some("connected"),
@@ -406,8 +427,19 @@ async fn account_scenario(restart: bool, history: usize, recovery: bool) {
                     Notice::Exchange(content::Event::Finished(_,o))=>eprintln!("RELAY_OWNER {i} finished {}",serde_json::to_string(o).unwrap()),_=>{}}
                 observed.lock().unwrap().push((i,event));}),work[i].clone(),work[i].epoch(),roster[i].clone(),Arc::new(RwLock::new(auth)),Arc::new(Mutex::new(Vec::<Weak<crate::bbs_sync::transport::Connection>>::new())))?;
             let engine=a.test_engine();*engine_slot.lock().unwrap()=Some(engine.clone());
-            engines.push(engine);controls.push(tx);tasks.push(tokio::spawn(a.run(rx)));pools.push(pool);stops.push(stop);
+            if let Some((passive, phase, manual)) = rendezvous {
+                a.test_rendezvous_backoff(if i == passive { phase * 1000 } else if manual {300_000} else {0}, i == passive).await?;
+                if manual && i != passive { tx.try_send(Command::Manual(work[i].epoch())).unwrap(); }
+                prepared.push((a, rx));
+            } else { tasks.push(tokio::spawn(a.run(rx))); }
+            engines.push(engine);controls.push(tx);pools.push(pool);stops.push(stop);
         }
+        // Synthetic failure injection ends here. Assertions below distinguish
+        // that seed from all real events/requests after the owners are running.
+        let live_events = notices.lock().unwrap().len();
+        let live_phases = phases.lock().unwrap().len();
+        let live_since = phase_origin.elapsed().as_millis();
+        for (a, rx) in prepared { tasks.push(tokio::spawn(a.run(rx))); }
         let expected=raw_sha256(&raw);
         let mut interrupted = None;
         let mut old_session = None;
@@ -458,8 +490,8 @@ async fn account_scenario(restart: bool, history: usize, recovery: bool) {
         let initial_usage=usage();
         if history>=1000 { eprintln!("BBS_DELTA_ACTOR_STAGE initialFull elapsedMs={} {}",watch_started.elapsed().as_millis(),initial_usage); }
         let mut changed_usage=Value::Null;
-        let mut automatic_ok=restart;
-        if wait.is_ok() && !restart && !recovery {
+        let mut automatic_ok=restart || rendezvous.is_some();
+        if wait.is_ok() && !restart && !recovery && rendezvous.is_none() {
             let edited=content::tests::publish(&changed_source,"Automatic edit after matching checkpoints");
             let resource=Resource{identity:ResourceKind::Post{thread_id:"thread-one".into(),post_id:"root".into(),version_id:raw_sha256(&edited)},sha256:raw_sha256(&edited),size_bytes:edited.len() as u64};
             let fence=crate::bbs::sync::GroupFence{group_id:f.contexts[0].peer.group_id.clone(),membership_id:f.contexts[1].peer.local_membership_id.clone()};
@@ -477,8 +509,8 @@ async fn account_scenario(restart: bool, history: usize, recovery: bool) {
             let before=initial_usage["manifestItems"].as_array().unwrap().iter().map(|v|v[2].as_u64().unwrap()).sum::<u64>();
             assert!(after-before<10,"automatic change must not resend the {history} unchanged versions: {initial_usage} -> {changed_usage}");
         }
-        let mut manual_ok=restart;
-        if wait.is_ok() && !restart && !recovery {
+        let mut manual_ok=restart || rendezvous.is_some();
+        if wait.is_ok() && !restart && !recovery && rendezvous.is_none() {
             let before=engines.iter().map(|e|e.manifest_counts()[2]).sum::<u64>();
             let target=notices.lock().unwrap().iter().filter(|(_,n)|matches!(n,Notice::Exchange(content::Event::Finished(_,o)) if o.failures.is_empty()&&!o.more)).count()+2;
             controls[1].send(Command::Manual(work[1].epoch())).await.unwrap();
@@ -557,6 +589,19 @@ async fn account_scenario(restart: bool, history: usize, recovery: bool) {
             assert_ne!(old_session, dirs.lock().unwrap().session, "fresh TLS session after boot loss");
         }
         let report:Vec<_>=notices.lock().unwrap().iter().map(|(i,n)|format!("{i}:{}",match n{Notice::Error(_,e)=>format!("error {e}"),Notice::Exchange(content::Event::Failed(_,e))=>format!("failed {e}"),Notice::Exchange(content::Event::Finished(_,o))=>format!("finished {}/{} failures={} more={}",o.completed,o.total,o.failures.len(),o.more),Notice::Connecting(_)=>"connecting".into(),Notice::Connected(_)=>"connected".into(),Notice::Disconnected(_)=>"disconnected".into(),_=>"progress".into()})).collect();
+        if let Some((passive, phase, manual)) = rendezvous {
+            phase_report(&format!("fixed-phase-{phase}-passive-{passive}-manual-{manual}"), live_phases, live_since);
+            let connected = phases.lock().unwrap().iter().skip(live_phases)
+                .filter(|(_,_,p)| *p == "connected").map(|(side,at,_)| (*side, at-live_since)).collect::<Vec<_>>();
+            assert_eq!(connected.len(), 2, "both real TLS channels: {report:?}");
+            assert!(connected.iter().all(|(_,ms)| *ms < ACTIVE_MS as u128), "TLS must connect within the existing 60s window: {connected:?}");
+            assert!(connected.iter().any(|(side,ms)| *side==passive && *ms < phase as u128 * 1000), "no expiry/Manual shortcut on passive side");
+            assert!(report.iter().skip(live_events).all(|r| !r.contains("error") && !r.contains("failed")), "no fault hidden after seed: {report:?}");
+            let d = dirs.lock().unwrap();
+            assert_eq!(d.calls.get("wake"), Some(&1), "passive response must not create/replace the wake");
+            assert_eq!(d.calls.get("ready"), Some(&2), "one Ready per endpoint, not every idle poll");
+            assert!(d.calls.get("poll").copied().unwrap_or(0) <= 35, "one group poller per actor, bounded by the unchanged start window");
+        }
         eprintln!("RELAY_COORDINATOR events={report:?} requests={:?}",dirs.lock().unwrap().calls);
         for w in &work {w.cancel();}
         for stop in stops {stop.cancel();}
@@ -570,8 +615,8 @@ async fn account_scenario(restart: bool, history: usize, recovery: bool) {
         let resource=Resource{identity:ResourceKind::Post{thread_id:"thread-one".into(),post_id:"root".into(),version_id:expected.clone()},sha256:expected,size_bytes:raw.len()as u64};
         assert_eq!(fs::read(sb.source(&fence,&resource).unwrap()).unwrap(),raw);
         assert_eq!(dat.lock().unwrap().created,4);
-        if !recovery { assert!(report.iter().all(|r|!r.contains("error")&&!r.contains("failed")),"{report:?}"); }
-        else { assert_eq!(report.iter().filter(|r|r.contains("error")||r.contains("failed")).cloned().collect::<Vec<_>>(),vec!["0:error sync_timeout"],"only the deliberately injected failure is expected"); }
+        if !recovery && rendezvous.is_none() { assert!(report.iter().all(|r|!r.contains("error")&&!r.contains("failed")),"{report:?}"); }
+        else if recovery { assert_eq!(report.iter().filter(|r|r.contains("error")||r.contains("failed")).cloned().collect::<Vec<_>>(),vec!["0:error sync_timeout"],"only the deliberately injected failure is expected"); }
         Ok(())
     }).await;
     host.stop_and_wait().await;

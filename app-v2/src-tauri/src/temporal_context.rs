@@ -1,9 +1,31 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, Local, SecondsFormat, Utc};
+use serde::{Deserialize, Serialize};
+
+/// The exact cross-day context attached to one composer send. The user text
+/// stays separate, and only the recipients listed here received this context.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposerTemporalGap {
+    pub current_time: String,
+    pub prompt: String,
+    pub target_agent_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub elapsed_days_by_target: BTreeMap<String, i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedComposerPrompt {
+    pub target_agent_id: String,
+    pub payload: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temporal_gap: Option<ComposerTemporalGap>,
+}
 
 const TEMPORAL_GAP_EVENT: &str = "temporal_gap_consumed";
 const TEMPORAL_GAP_THRESHOLD_HOURS: i64 = 24;
@@ -22,6 +44,73 @@ struct CompletedTurn {
 }
 
 impl TemporalContextManager {
+    pub fn prepare_composer(
+        &self,
+        project_root: &Path,
+        message_id: &str,
+        timestamp: &str,
+        target_agent_ids: &[String],
+        payload: &str,
+        now: DateTime<Local>,
+    ) -> Result<(Vec<PreparedComposerPrompt>, Vec<std::path::PathBuf>), String> {
+        if message_id.trim().is_empty() || DateTime::parse_from_rfc3339(timestamp).is_err() {
+            return Err("invalid composer message identity".into());
+        }
+        let mut seen = HashSet::new();
+        let mut elapsed_days_by_target = BTreeMap::new();
+        let mut prepared = target_agent_ids
+            .iter()
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty() && seen.insert((*id).to_string()))
+            .map(|id| {
+                let (payload, elapsed_days) =
+                    self.prepare_with_elapsed_days_best_effort(project_root, id, payload, now);
+                if let Some(days) = elapsed_days {
+                    elapsed_days_by_target.insert(id.to_string(), days);
+                }
+                PreparedComposerPrompt {
+                    target_agent_id: id.to_string(),
+                    payload,
+                    temporal_gap: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let temporal_targets = prepared
+            .iter()
+            .filter(|item| item.payload != payload)
+            .map(|item| item.target_agent_id.clone())
+            .collect::<Vec<_>>();
+        if temporal_targets.is_empty() {
+            return Ok((prepared, Vec::new()));
+        }
+        let gap = ComposerTemporalGap {
+            current_time: now.to_rfc3339_opts(SecondsFormat::Secs, false),
+            prompt: render_temporal_gap_payload("", now),
+            target_agent_ids: temporal_targets,
+            elapsed_days_by_target,
+        };
+        // Do not hand a wrapped prompt to the caller until its clean original
+        // and context are durable. On failure the caller sends the plain prompt.
+        let recipients = prepared
+            .iter()
+            .map(|item| item.target_agent_id.clone())
+            .collect::<Vec<_>>();
+        let changed = crate::violet::record_composer_temporal_message(
+            project_root,
+            message_id,
+            timestamp,
+            payload,
+            &recipients,
+            &gap,
+        )?;
+        for item in &mut prepared {
+            if gap.target_agent_ids.contains(&item.target_agent_id) {
+                item.temporal_gap = Some(gap.clone());
+            }
+        }
+        Ok((prepared, changed))
+    }
+
     pub fn prepare_payload_best_effort(
         &self,
         project_root: &Path,
@@ -29,13 +118,24 @@ impl TemporalContextManager {
         payload: &str,
         now: DateTime<Local>,
     ) -> String {
+        self.prepare_with_elapsed_days_best_effort(project_root, target_agent_id, payload, now)
+            .0
+    }
+
+    fn prepare_with_elapsed_days_best_effort(
+        &self,
+        project_root: &Path,
+        target_agent_id: &str,
+        payload: &str,
+        now: DateTime<Local>,
+    ) -> (String, Option<i64>) {
         match self.prepare_payload(project_root, target_agent_id, payload, now) {
             Ok(prepared) => prepared,
             Err(err) => {
                 crate::kota_debug_log(&format!(
                     "[temporal-context] skipped for {target_agent_id}: {err}"
                 ));
-                payload.to_string()
+                (payload.to_string(), None)
             }
         }
     }
@@ -46,10 +146,10 @@ impl TemporalContextManager {
         target_agent_id: &str,
         payload: &str,
         now: DateTime<Local>,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Option<i64>), String> {
         let target_agent_id = target_agent_id.trim();
         if target_agent_id.is_empty() || payload.trim().is_empty() {
-            return Ok(payload.to_string());
+            return Ok((payload.to_string(), None));
         }
 
         let _guard = self
@@ -59,7 +159,7 @@ impl TemporalContextManager {
         let ledger = match fs::read_to_string(crate::credit_events_path(project_root)) {
             Ok(ledger) => ledger,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(payload.to_string())
+                return Ok((payload.to_string(), None))
             }
             Err(err) => {
                 return Err(format!(
@@ -70,17 +170,16 @@ impl TemporalContextManager {
         };
         let (turn, consumed_turn_ids) = temporal_context_state(&ledger, target_agent_id)?;
         let Some(turn) = turn else {
-            return Ok(payload.to_string());
+            return Ok((payload.to_string(), None));
         };
-        if now
+        let elapsed = now
             .with_timezone(&Utc)
-            .signed_duration_since(turn.occurred_at)
-            < Duration::hours(TEMPORAL_GAP_THRESHOLD_HOURS)
-        {
-            return Ok(payload.to_string());
+            .signed_duration_since(turn.occurred_at);
+        if elapsed < Duration::hours(TEMPORAL_GAP_THRESHOLD_HOURS) {
+            return Ok((payload.to_string(), None));
         }
         if consumed_turn_ids.contains(&turn.event_id) {
-            return Ok(payload.to_string());
+            return Ok((payload.to_string(), None));
         }
 
         // Consume before delivery and never roll back. A failed send may miss one
@@ -95,7 +194,10 @@ impl TemporalContextManager {
             }),
         )?;
 
-        Ok(render_temporal_gap_payload(payload, now))
+        Ok((
+            render_temporal_gap_payload(payload, now),
+            Some(elapsed.num_days()),
+        ))
     }
 }
 
@@ -186,6 +288,22 @@ fn render_temporal_gap_payload(payload: &str, now: DateTime<Local>) -> String {
         TEMPORAL_GAP_COPY,
         payload
     )
+}
+
+pub(crate) fn is_temporal_gap_prompt(text: &str) -> bool {
+    let mut lines = text.lines();
+    let Some(time) = lines
+        .next()
+        .and_then(|line| line.strip_prefix("<KOTA_TEMPORAL_GAP v=\"1\" current_time=\""))
+        .and_then(|value| value.strip_suffix("\">"))
+    else {
+        return false;
+    };
+    !time.is_empty()
+        && time.len() <= 64
+        && !time.contains('"')
+        && lines.next() == Some(TEMPORAL_GAP_COPY)
+        && lines.next() == Some("</KOTA_TEMPORAL_GAP>")
 }
 
 #[cfg(test)]
@@ -320,5 +438,173 @@ mod tests {
             "hello b"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn composer_temporal_original_and_context_survive_without_provider_logs() {
+        let root = temp_root("fable-composer-history");
+        let now = local_time("2026-08-18T12:00:00-07:00");
+        append_turn(
+            &root,
+            "agent-fable-amber",
+            "fable-turn-old",
+            "2026-08-15T12:00:00Z",
+        );
+        append_turn(
+            &root,
+            "agent-fable-birch",
+            "fable-turn-new",
+            "2026-08-18T18:59:00Z",
+        );
+        append_turn(
+            &root,
+            "agent-fable-cedar",
+            "fable-turn-previous-day",
+            "2026-08-17T19:00:00Z",
+        );
+        let targets = vec![
+            "agent-fable-amber".into(),
+            "agent-fable-birch".into(),
+            "agent-fable-cedar".into(),
+        ];
+        let text =
+            "Check this file\n/synthetic/fable/project-memory/attachments/composer/image.png";
+        let (prepared, changed) = TemporalContextManager::default()
+            .prepare_composer(
+                &root,
+                "fable-composer-one",
+                "2026-08-18T18:59:59Z",
+                &targets,
+                text,
+                now,
+            )
+            .unwrap();
+        assert!(!changed.is_empty());
+        let gap = prepared[0].temporal_gap.as_ref().unwrap();
+        assert_eq!(
+            gap.target_agent_ids,
+            vec!["agent-fable-amber", "agent-fable-cedar"]
+        );
+        assert_eq!(
+            gap.elapsed_days_by_target,
+            BTreeMap::from([
+                ("agent-fable-amber".into(), 3),
+                ("agent-fable-cedar".into(), 1),
+            ])
+        );
+        assert_eq!(prepared[0].payload, format!("{}{}", gap.prompt, text));
+        assert_eq!(prepared[1].payload, text);
+        assert!(prepared[1].temporal_gap.is_none());
+        assert_eq!(prepared[2].temporal_gap.as_ref(), Some(gap));
+        // No source file, provider process, source cursor, or frontend memory is
+        // supplied: exercise the same reader used after an App restart.
+        let request = serde_json::from_value(serde_json::json!({})).unwrap();
+        let state = crate::violet::read_cache(&root, request).unwrap();
+        assert_eq!(state.messages.len(), 1);
+        let saved = &state.messages[0];
+        assert_eq!(saved.id, "fable-composer-one");
+        assert_eq!(saved.role, "user");
+        assert_eq!(saved.agent_id, "user");
+        assert_eq!(saved.text, text);
+        assert_eq!(saved.timestamp, "2026-08-18T18:59:59Z");
+        assert_eq!(saved.target_agent_ids, targets);
+        assert_eq!(saved.temporal_gap.as_ref(), Some(gap));
+
+        // Re-writing the same event is idempotent. A separate user send with
+        // identical text is not hidden by the legacy two-minute text bucket.
+        crate::violet::record_composer_temporal_message(
+            &root,
+            &saved.id,
+            &saved.timestamp,
+            text,
+            &targets,
+            gap,
+        )
+        .unwrap();
+        crate::violet::record_composer_temporal_message(
+            &root,
+            "fable-composer-two",
+            &saved.timestamp,
+            text,
+            &targets,
+            gap,
+        )
+        .unwrap();
+        let request = serde_json::from_value(serde_json::json!({})).unwrap();
+        let reread = crate::violet::read_cache(&root, request).unwrap();
+        assert_eq!(reread.messages.len(), 2);
+        assert!(reread.messages.iter().all(|message| message.text == text));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn old_composer_context_without_elapsed_days_still_loads() {
+        let gap: ComposerTemporalGap = serde_json::from_value(serde_json::json!({
+            "currentTime": "2026-08-18T19:00:00Z",
+            "prompt": "saved reminder",
+            "targetAgentIds": ["agent-fable-amber"]
+        }))
+        .unwrap();
+        assert!(gap.elapsed_days_by_target.is_empty());
+    }
+
+    #[test]
+    fn composer_without_temporal_context_keeps_the_existing_path() {
+        let root = temp_root("fable-composer-plain");
+        let (prepared, changed) = TemporalContextManager::default()
+            .prepare_composer(
+                &root,
+                "fable-composer-plain",
+                "2026-08-18T19:00:00Z",
+                &["agent-fable-amber".into()],
+                "ordinary prompt",
+                local_time("2026-08-18T19:00:00Z"),
+            )
+            .unwrap();
+        assert_eq!(prepared[0].payload, "ordinary prompt");
+        assert!(prepared[0].temporal_gap.is_none());
+        assert!(changed.is_empty());
+        assert!(!root.join("project-memory/chathistory").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn composer_history_failure_does_not_return_a_wrapped_prompt() {
+        let root = temp_root("fable-composer-failure");
+        append_turn(
+            &root,
+            "agent-fable-amber",
+            "fable-turn",
+            "2026-08-15T12:00:00Z",
+        );
+        fs::create_dir_all(root.join("project-memory")).unwrap();
+        fs::write(root.join("project-memory/chathistory"), "not a directory").unwrap();
+        assert!(TemporalContextManager::default()
+            .prepare_composer(
+                &root,
+                "fable-composer-failed",
+                "2026-08-18T19:00:00Z",
+                &["agent-fable-amber".into()],
+                "ordinary prompt",
+                local_time("2026-08-18T19:00:00Z"),
+            )
+            .is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn temporal_echo_recognition_does_not_treat_actor_envelopes_as_composer_echoes() {
+        let temporal = render_temporal_gap_payload("hello", local_time("2026-08-18T19:00:00Z"));
+        assert!(is_temporal_gap_prompt(&temporal));
+        assert!(is_temporal_gap_prompt(&temporal.replace('\n', "\r\n")));
+        assert!(!is_temporal_gap_prompt(
+            &temporal.replace("v=\"1\"", "v=\"2\"")
+        ));
+        assert!(!is_temporal_gap_prompt(&format!(
+            "<KOTA_MESSAGE id=\"fable-bus\" from=\"laughing-man\" to=\"agent-fable\" intent=\"telegram\">\n{temporal}\n</KOTA_MESSAGE>"
+        )));
+        assert!(!is_temporal_gap_prompt(&format!(
+            "Quoted example:\n{temporal}"
+        )));
     }
 }

@@ -678,6 +678,27 @@ impl IntegrationManager {
         Ok(workspace)
     }
 
+    /// Settings IPC validates the ID first. Reuse the active registration without
+    /// preparing it or racing an in-place workspace.json refresh on disk.
+    pub fn project_settings_root(&self, project_id: &str) -> Result<PathBuf> {
+        let project_id = project_id.trim();
+        let cached_root = {
+            let guard = self
+                .active_workspace
+                .lock()
+                .expect("workspace state poisoned");
+            guard
+                .as_ref()
+                .filter(|workspace| workspace.project_id == project_id)
+                .map(|workspace| PathBuf::from(&workspace.local_root))
+        };
+        if let Some(root) = cached_root {
+            return Ok(root);
+        }
+        // No disk I/O or workspace preparation while holding the active mutex.
+        project_settings_root_at(&workspace_project_root(project_id), project_id)
+    }
+
     pub fn archive_workspace_project(
         &self,
         req: WorkspaceProjectLifecycleRequest,
@@ -2452,6 +2473,20 @@ fn workspace_project_root(project_id: &str) -> PathBuf {
     kota_workspaces_dir().join(project_id.trim())
 }
 
+fn project_settings_root_at(root: &Path, project_id: &str) -> Result<PathBuf> {
+    let path = root.join("workspace.json");
+    let workspace: WorkspaceProject = serde_json::from_slice(
+        &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+    )
+    .with_context(|| format!("decode {}", path.display()))?;
+    if workspace.project_id != project_id {
+        bail!("Workspace project id mismatch");
+    }
+    // local_root in a moved account can be stale. Its registration directory is
+    // authoritative; normal project loading owns rebasing/migration, not settings.
+    Ok(root.to_path_buf())
+}
+
 fn save_active_workspace(workspace: &WorkspaceProject) -> Result<()> {
     let path = active_workspace_path();
     if let Some(parent) = path.parent() {
@@ -3550,6 +3585,175 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn settings_workspace_for_test(root: &Path, project_id: &str) -> WorkspaceProject {
+        let mut workspace = workspace_for_test(root, Vec::new());
+        workspace.project_id = project_id.into();
+        fs::create_dir_all(root).unwrap();
+        fs::write(
+            root.join("workspace.json"),
+            serde_json::to_vec_pretty(&workspace).unwrap(),
+        )
+        .unwrap();
+        workspace
+    }
+
+    fn settings_tree_snapshot(root: &Path) -> Vec<(PathBuf, &'static str, Vec<u8>)> {
+        fn visit(base: &Path, dir: &Path, entries: &mut Vec<(PathBuf, &'static str, Vec<u8>)>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let relative = path.strip_prefix(base).unwrap().to_path_buf();
+                let kind = entry.file_type().unwrap();
+                if kind.is_symlink() {
+                    entries.push((
+                        relative,
+                        "link",
+                        path_str(&fs::read_link(path).unwrap()).into_bytes(),
+                    ));
+                } else if kind.is_dir() {
+                    entries.push((relative, "dir", Vec::new()));
+                    visit(base, &path, entries);
+                } else {
+                    entries.push((relative, "file", fs::read(path).unwrap()));
+                }
+            }
+        }
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries.sort();
+        entries
+    }
+
+    #[test]
+    fn project_settings_lookup_keeps_registered_projects_and_email_operations_isolated() {
+        let root = temp_dir("settings-isolation");
+        let copper = root.join("fable-copper");
+        let indigo = root.join("fable-indigo");
+        let cached = settings_workspace_for_test(&copper, "fable-copper");
+        settings_workspace_for_test(&indigo, "fable-indigo");
+        let manager = manager_with_workspace_for_test(cached);
+        // The active path must not read a registration being rewritten on disk.
+        fs::remove_file(copper.join("workspace.json")).unwrap();
+        let resolve = |project_id: &str| match project_id {
+            "fable-copper" => manager.project_settings_root("  fable-copper  ").unwrap(),
+            // Exercise the same fallback core with a synthetic registration root,
+            // not a real account directory or a global HOME override.
+            _ => project_settings_root_at(&root.join(project_id), project_id).unwrap(),
+        };
+        let before = settings_tree_snapshot(&root);
+        assert_eq!(resolve("fable-copper"), copper);
+        assert_eq!(resolve("fable-indigo"), indigo);
+        assert_eq!(settings_tree_snapshot(&root), before);
+        let read = |id| {
+            crate::project_settings::read(&resolve(id))
+                .unwrap()
+                .commit_email
+        };
+        let save = |id, email: Option<&str>| {
+            crate::project_settings::save_commit_email(&resolve(id), email.map(str::to_owned))
+                .unwrap()
+        };
+        assert_eq!(read("fable-copper"), None);
+        save("fable-copper", Some("copper@fable.example"));
+        assert_eq!(read("fable-indigo"), None);
+        save("fable-indigo", Some("indigo@fable.example"));
+        assert_eq!(
+            read("fable-copper").as_deref(),
+            Some("copper@fable.example")
+        );
+        save("fable-copper", None);
+        assert_eq!(read("fable-copper"), None);
+        assert_eq!(
+            read("fable-indigo").as_deref(),
+            Some("indigo@fable.example")
+        );
+        save("fable-indigo", None);
+        assert_eq!(read("fable-indigo"), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_settings_lookup_uses_registration_root_without_preparing_or_rewriting() {
+        let root = temp_dir("settings-read-only");
+        let registered = root.join("fable-copper");
+        let mut workspace = settings_workspace_for_test(&registered, "fable-copper");
+        workspace.local_root = path_str(&root.join("old-account/fable-copper"));
+        workspace.github_html_url.clear();
+        fs::write(
+            registered.join("workspace.json"),
+            serde_json::to_vec_pretty(&workspace).unwrap(),
+        )
+        .unwrap();
+        for (relative, content) in [
+            ("shared/keep.md", "legacy memory"),
+            (".kota/rules/keep.md", "legacy rules"),
+            (
+                ".agent-workspaces/fable-helper/agent.yaml",
+                "id: fable-helper\n",
+            ),
+            (
+                ".agent-workspaces/fable-helper/SHELL.yaml",
+                "provider: codex\n",
+            ),
+            ("project-memory/bbs", "preserve this marker"),
+        ] {
+            let path = registered.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        let before = settings_tree_snapshot(&root);
+        assert_eq!(
+            project_settings_root_at(&registered, "fable-copper").unwrap(),
+            registered
+        );
+        assert_eq!(settings_tree_snapshot(&root), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_settings_lookup_rejects_invalid_ids_and_registrations_without_writes() {
+        let root = temp_dir("settings-invalid-registration");
+        let registered = root.join("fable-copper");
+        let workspace = settings_workspace_for_test(&registered, "fable-copper");
+        let manager = manager_with_workspace_for_test(workspace.clone());
+        let before = settings_tree_snapshot(&root);
+        for project_id in [
+            "",
+            " ",
+            ".",
+            "..",
+            "../fable-copper",
+            "/fable-copper",
+            "fable/copper",
+            "fable\\copper",
+            "fable-copper/",
+        ] {
+            assert_eq!(
+                crate::project_settings_root(&manager, project_id.into()).unwrap_err(),
+                "Invalid project id"
+            );
+        }
+        assert_eq!(settings_tree_snapshot(&root), before);
+        let mut wrong_id = workspace.clone();
+        wrong_id.project_id = "fable-indigo".into();
+        for invalid in [
+            b"broken".to_vec(),
+            b"{}".to_vec(),
+            serde_json::to_vec(&wrong_id).unwrap(),
+        ] {
+            fs::write(registered.join("workspace.json"), invalid).unwrap();
+            let before = settings_tree_snapshot(&root);
+            assert!(project_settings_root_at(&registered, "fable-copper").is_err());
+            assert_eq!(settings_tree_snapshot(&root), before);
+        }
+        fs::remove_file(registered.join("workspace.json")).unwrap();
+        let before = settings_tree_snapshot(&root);
+        assert!(project_settings_root_at(&registered, "fable-copper").is_err());
+        assert!(project_settings_root_at(&root.join("missing"), "missing").is_err());
+        assert_eq!(settings_tree_snapshot(&root), before);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

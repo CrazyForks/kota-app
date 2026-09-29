@@ -11,7 +11,7 @@
 //   - I-4 same portable-pty + alacritty_terminal infra as smart.rs
 //   - I-5 zero protocol parsing — whatever the CLI prints, the seat renders
 //   - I-15 path env vars include KOTA_PROJECT_MEMORY_DIR and KOTA_PROJECT_RULES_DIR
-//   - I-26 GIT_AUTHOR_EMAIL = "{agent_id}@kota.local"
+//   - I-26 default GIT_AUTHOR_EMAIL = "{agent_id}@kota.local" (project override optional)
 //   - I-31 dogfood-min ships CC + Codex; Antigravity / OpenCode reserved for M7+
 
 use std::collections::HashMap;
@@ -2242,23 +2242,9 @@ impl AgentTerminalPty {
             cmd.env("KOTA_PROJECT_BASE_REF", project_base_ref);
         }
 
-        // Per I-26: agent commits authored as {id}@kota.local.
-        cmd.env(
-            "GIT_AUTHOR_EMAIL",
-            format!("{}@kota.local", self.inner.agent_id),
-        );
-        cmd.env(
-            "GIT_AUTHOR_NAME",
-            format!("{} (Agent)", self.inner.agent_id),
-        );
-        cmd.env(
-            "GIT_COMMITTER_EMAIL",
-            format!("{}@kota.local", self.inner.agent_id),
-        );
-        cmd.env(
-            "GIT_COMMITTER_NAME",
-            format!("{} (Agent)", self.inner.agent_id),
-        );
+        // Read at every actual spawn, not when the session object is created.
+        // Existing PTYs deliberately keep their identity until their next start.
+        apply_agent_git_identity(&mut cmd, &self.inner.project_root, &self.inner.agent_id);
 
         #[cfg(unix)]
         let tty_name = pair
@@ -2883,6 +2869,21 @@ fn count_bytes(haystack: &[u8], needle: &[u8]) -> usize {
         .count()
 }
 
+fn apply_agent_git_identity(
+    cmd: &mut CommandBuilder,
+    project_root: &Path,
+    agent_id: &str,
+) {
+    let default_email = format!("{agent_id}@kota.local");
+    let email = crate::project_settings::runtime_commit_email(project_root, &default_email)
+        .unwrap_or(default_email);
+    let name = format!("{agent_id} (Agent)");
+    cmd.env("GIT_AUTHOR_EMAIL", &email);
+    cmd.env("GIT_COMMITTER_EMAIL", &email);
+    cmd.env("GIT_AUTHOR_NAME", &name);
+    cmd.env("GIT_COMMITTER_NAME", &name);
+}
+
 fn should_inherit_agent_spawn_env(key: &str) -> bool {
     if key == "PWD" || key == "OLDPWD" || key == "AI_AGENT" || key.starts_with("KOTA_") {
         return false;
@@ -3127,6 +3128,70 @@ impl AgentRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_commit_email_is_read_per_spawn_without_changing_existing_identity() {
+        let root = std::env::temp_dir().join(format!("agent-email-{}", uuid::Uuid::new_v4()));
+        let other = root.join("other");
+        fs::create_dir_all(&other).unwrap();
+        let make = |project: &Path| {
+            let mut cmd = CommandBuilder::new("git");
+            cmd.env("GIT_AUTHOR_EMAIL", "inherited@fable.example");
+            cmd.env("GIT_COMMITTER_EMAIL", "inherited@fable.example");
+            apply_agent_git_identity(&mut cmd, project, "agent-fable-copper");
+            cmd
+        };
+        let value = |cmd: &CommandBuilder, key: &str| cmd.get_env(key).unwrap().to_string_lossy().to_string();
+        let existing = make(&root);
+        assert_eq!(value(&existing, "GIT_AUTHOR_EMAIL"), "agent-fable-copper@kota.local");
+        crate::project_settings::save_commit_email(&root, Some("random-string".into())).unwrap();
+        let next = make(&root);
+        for key in ["GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"] {
+            assert_eq!(value(&next, key), "random-string");
+            assert_eq!(value(&existing, key), "agent-fable-copper@kota.local");
+            assert_eq!(value(&make(&other), key), "agent-fable-copper@kota.local");
+        }
+        for key in ["GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"] {
+            assert_eq!(value(&next, key), "agent-fable-copper (Agent)");
+        }
+        // Use the real launch env in Git; do not just assert the setting's JSON.
+        let run = |args: &[&str]| {
+            let mut cmd = Command::new("git");
+            cmd.current_dir(&root).args(args);
+            for key in ["GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL", "GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"] {
+                cmd.env(key, next.get_env(key).unwrap());
+            }
+            let output = cmd.output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(&["init"]);
+        run(&["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "synthetic identity"]);
+        assert_eq!(run(&["log", "-1", "--format=%an|%ae|%cn|%ce"]).trim(), "agent-fable-copper (Agent)|random-string|agent-fable-copper (Agent)|random-string");
+        crate::project_settings::save_commit_email(&root, None).unwrap();
+        assert_eq!(value(&make(&root), "GIT_AUTHOR_EMAIL"), "agent-fable-copper@kota.local");
+        assert_eq!(value(&next, "GIT_AUTHOR_EMAIL"), "random-string");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_commit_email_corrupt_settings_keep_agent_default_identity() {
+        let root = std::env::temp_dir().join(format!("agent-email-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("project-settings.json"), "broken").unwrap();
+        let mut cmd = CommandBuilder::new("git");
+        cmd.env("GIT_AUTHOR_EMAIL", "inherited@fable.example");
+        cmd.env("GIT_COMMITTER_EMAIL", "inherited@fable.example");
+        apply_agent_git_identity(&mut cmd, &root, "agent-fable-copper");
+        for key in ["GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"] {
+            assert_eq!(cmd.get_env(key).unwrap(), "agent-fable-copper@kota.local");
+        }
+        for key in ["GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"] {
+            assert_eq!(cmd.get_env(key).unwrap(), "agent-fable-copper (Agent)");
+        }
+        assert_eq!(fs::read_to_string(root.join("project-settings.json")).unwrap(), "broken");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn cli_bin_names() {

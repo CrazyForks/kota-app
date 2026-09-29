@@ -5,7 +5,7 @@ use super::{
     announcement::{Intent, Scope},
     discovery::{Item, Page, Ready},
     handshake::{self, Handshake},
-    http::{HttpClient, Reply},
+    http::{HttpClient, PendingHttp, Reply},
     proof::{compact_json, Fields, Route, SignedRequest, Target},
     upload::Body,
     window::Payload,
@@ -46,18 +46,23 @@ pub(super) struct Call {
 }
 impl Call {
     pub(super) async fn execute(&self) -> Result<Reply> {
+        self.complete(self.submit()?).await
+    }
+    pub(super) fn submit(&self) -> Result<PendingHttp> {
         self.client.check(self.deadline)?;
-        let reply = self
+        self
             .client
             .http
-            .execute(
+            .submit(
                 self.signed.clone(),
                 self.body.clone().map(Body::from),
                 self.client.cancel.clone(),
                 self.client.authorized.clone(),
                 self.deadline,
             )
-            .await?;
+    }
+    pub(super) async fn complete(&self, pending: PendingHttp) -> Result<Reply> {
+        let reply = pending.wait().await?;
         self.client.check(self.deadline)?;
         if reply.status != 200 {
             return Err(reply.error());

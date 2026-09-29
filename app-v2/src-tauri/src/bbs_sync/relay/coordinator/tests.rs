@@ -6,6 +6,9 @@ use crate::bbs_sync::{
     transport::{FileIo, Limits},
 };
 
+mod rendezvous;
+mod rendezvous_guards;
+
 struct Rig {
     _root: exchange::tests::Root,
     actor: Actor,
@@ -225,6 +228,8 @@ async fn member_replacement_retires_attempt_and_current_authority_never_trusts_o
             waiting_poll: false,
             tls: None,
             cancel: cancel.clone(),
+            passive_boot: None,
+            trace: Trace::new(false, None),
         },
     );
     let mut next = r.actor.initial.clone();
@@ -517,6 +522,7 @@ async fn a_replaced_wake_is_retired_after_fresh_poll_not_after_sixty_seconds() {
         polls: 0, wake: Some("c".repeat(64)), nonce: "old-nonce-123".into(),
         ready_boot: None, handshake: None, offered: false, waiting_poll: true,
         tls: None, cancel: Cancellation::default(),
+        passive_boot: None, trace: Trace::new(false, None),
     });
     r.actor.snapshot = Some(Snapshot { boot: page.boot.clone(),
         items: page.items.iter().cloned().map(|i| (i.device.clone(), i)).collect() });
@@ -535,7 +541,7 @@ async fn idle_boot_change_after_completion_does_not_create_new_verification_work
     r.actor.connected.insert(r.peer.clone(), Connected {
         peer: r.actor.initial.peer(&r.peer).unwrap(), instance: "remote-instance-123".into(),
         session: "d".repeat(64), wake: "e".repeat(64), link: None,
-        finished: true, closing_at: Some(now()),
+        finished: true, closing_at: Some(now()), trace: Trace::new(false, None),
     });
     r.actor.adopt_snapshot(Snapshot { boot: "new-idle-boot-123".into(), items: BTreeMap::new() });
     assert!(r.actor.connected.is_empty());

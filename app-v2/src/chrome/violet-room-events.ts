@@ -1,3 +1,5 @@
+import type { ComposerTemporalGap } from '../pty-client';
+
 export const VIOLET_COMPOSER_SENT_EVENT = 'kota:violet-composer-sent';
 export const VIOLET_COMPOSER_DELIVERY_EVENT = 'kota:violet-composer-delivery';
 export const VIOLET_COMPOSER_AGENT_EXIT_REASON = 'Agent exited before this prompt was confirmed.';
@@ -12,6 +14,7 @@ export interface VioletComposerSentDetail {
   mentions?: { agentId: string; aka: string }[];
   timestamp: string;
   privacy: boolean;
+  temporalGap?: ComposerTemporalGap | null;
   delivery?: Omit<VioletComposerDeliveryDetail, 'id'>;
 }
 
@@ -69,6 +72,16 @@ export function emitVioletComposerDelivery(detail: VioletComposerDeliveryDetail)
   recordVioletComposerDelivery(detail);
   window.dispatchEvent(new CustomEvent<VioletComposerDeliveryDetail>(VIOLET_COMPOSER_DELIVERY_EVENT, {
     detail,
+  }));
+}
+
+export function recordVioletComposerTemporalGap(id: string, temporalGap: ComposerTemporalGap) {
+  const index = VIOLET_COMPOSER_SENT_HISTORY.findIndex((message) => message.id === id);
+  if (index < 0) return;
+  const next = { ...VIOLET_COMPOSER_SENT_HISTORY[index]!, temporalGap };
+  VIOLET_COMPOSER_SENT_HISTORY[index] = next;
+  window.dispatchEvent(new CustomEvent<VioletComposerSentDetail>(VIOLET_COMPOSER_SENT_EVENT, {
+    detail: next,
   }));
 }
 

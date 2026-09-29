@@ -6,7 +6,7 @@ use super::{
     announcement::{Completion, Intent, Outbox, Receipt, Scope},
     discovery::Item,
     handshake::Handshake,
-    http::{HttpClient, Reply},
+    http::{HttpClient, PendingHttp, Reply},
     metadata::{self, Call, Client, Snapshot, WakeIntent, WakeResult},
     pump::Pump,
     Error, Result, TlsStream,
@@ -32,6 +32,9 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+mod rendezvous;
+use rendezvous::{blocks_discovery, PeerRecovery, Trace};
+
 const IDLE_POLL_MS: u64 = 30_000;
 #[derive(Clone, Copy)]
 enum ServiceTask {
@@ -44,6 +47,9 @@ enum ServiceTask {
 struct ServiceBackoff {
     failures: u8,
     until: u64,
+    // A later ordinary timeout cannot overwrite a still-live platform/safety
+    // restriction. Cleared only with this slot's existing success semantics.
+    cross_until: u64,
 }
 type Flight<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 enum FileDone {
@@ -74,6 +80,8 @@ struct Attempt {
     waiting_poll: bool,
     tls: Option<TlsStream>,
     cancel: Cancellation,
+    passive_boot: Option<String>,
+    trace: Trace,
 }
 struct Connected {
     peer: PeerIdentity,
@@ -83,6 +91,7 @@ struct Connected {
     link: Option<Arc<Link>>,
     finished: bool,
     closing_at: Option<u64>,
+    trace: Trace,
 }
 
 pub(crate) struct Actor {
@@ -105,6 +114,8 @@ pub(crate) struct Actor {
     // Unlike queued Manual/change triggers, a failed verification survives
     // Cancel until a future allowed round succeeds (or membership is removed).
     verification: BTreeSet<String>,
+    recovery: BTreeMap<String, PeerRecovery>,
+    manual_queued: Option<Instant>,
     seen_wakes: Nonces,
     attempts: BTreeMap<String, Attempt>,
     connected: BTreeMap<String, Connected>,
@@ -123,6 +134,9 @@ pub(crate) struct Actor {
     needs_refresh: bool,
     refresh_at: u64,
     poll_at: u64,
+    // Local queue/byte backpressure retries admission, not another discovery
+    // request. No credit is spent and no remote work exists at this boundary.
+    admission_at: Option<u64>,
     // A successful read must not discharge a failed announcement/write. Keep
     // four bounded operation streaks, not one lifetime failure counter.
     service_backoff: [ServiceBackoff; 4],
@@ -212,6 +226,8 @@ impl Actor {
             schedule,
             forced: BTreeSet::new(),
             verification: BTreeSet::new(),
+            recovery: BTreeMap::new(),
+            manual_queued: None,
             seen_wakes: Nonces::default(),
             attempts: BTreeMap::new(),
             connected: BTreeMap::new(),
@@ -230,6 +246,7 @@ impl Actor {
             needs_refresh: true,
             refresh_at: now() + HEARTBEAT_MS,
             poll_at: now(),
+            admission_at: None,
             service_backoff: [ServiceBackoff::default(); 4],
             manual_until: None,
             cancelled_until: None,
@@ -330,8 +347,11 @@ impl Actor {
             .peers
             .iter()
             .filter(|(id, p)| {
-                if !p.needed || p.busy || at < p.retry_at {
+                if !p.needed || p.busy {
                     return false;
+                }
+                if at < p.retry_at || at < self.service_retry() {
+                    return self.passive_candidate(id, at);
                 }
                 if p.online {
                     return true;
@@ -379,12 +399,14 @@ impl Actor {
         // maximum would hide real installs in a later recovery round.
         self.progress.remove(id);
         if let Some(a) = self.attempts.remove(id) {
+            a.trace.event("retired", None, 0);
             a.cancel.cancel();
             if let Some(w) = a.wake {
                 self.retired(id, &w);
             }
         }
         if let Some(c) = self.connected.remove(id) {
+            c.trace.event("retired", None, 0);
             if let Some(l) = c.link {
                 l.cancel();
             }
@@ -436,6 +458,8 @@ impl Actor {
         self.announcing = false;
         self.needs_refresh = false;
         self.manual_until = None;
+        self.manual_queued = None;
+        self.admission_at = None;
         self.cancelled_until = Some(self.refresh_at);
         self.instance = uuid::Uuid::new_v4().to_string();
         // Cancel leaves future automatic work enabled, but no queued pre-cancel
@@ -443,12 +467,18 @@ impl Actor {
         self.poll_at = now().saturating_add(IDLE_POLL_MS);
     }
     fn fail(&mut self, id: &str, error: Error) {
+        if let Some(a) = self.attempts.get(id) {
+            a.trace.event("failed", Some(error), 0);
+        } else if let Some(c) = self.connected.get(id) {
+            c.trace.event("failed", Some(error), 0);
+        }
         self.remove(id);
         if error == Error::Cancelled {
             return;
         }
         if error == Error::Busy {
             self.schedule.occupied(id, now());
+            self.record_failure(id, error);
             return;
         }
         // A matching old checkpoint is not evidence that this failed attempt
@@ -467,18 +497,21 @@ impl Actor {
                     p.needed = true;
                 }
                 self.poll_at = self.poll_at.min(now() + POLL_MS);
+                self.record_failure(id, error);
                 return;
             }
         }
         self.schedule.failed(id, now());
+        self.record_failure(id, error);
         if let Some(peer) = self.schedule.peers.get(id) {
             self.poll_at = self.poll_at.min(peer.retry_at.max(self.service_retry()));
         }
         self.manual_until = None;
         self.emit(Notice::Error(id.into(), error));
+        self.manual_queued = None;
     }
     fn service_retry(&self) -> u64 {
-        self.service_backoff.iter().map(|b| b.until).max().unwrap_or(0)
+        self.service_backoff.iter().map(|b| b.until.max(b.cross_until)).max().unwrap_or(0)
     }
     fn service_ok(&mut self, task: ServiceTask) {
         self.service_backoff[task as usize] = ServiceBackoff::default();
@@ -495,10 +528,18 @@ impl Actor {
             (5_000u64 << (backoff.failures - 1)).min(300_000)
         };
         backoff.until = now() + delay;
+        if blocks_discovery(error) {
+            backoff.cross_until = backoff.cross_until.max(backoff.until);
+        }
         // Retry at the existing failure deadline, not at a stale 30-second
         // idle poll. Other operation/peer backoffs remain admission guards.
         self.poll_at = self.poll_at.min(backoff.until);
+        Trace::backoff(match task {
+            ServiceTask::Poll => "poll", ServiceTask::Announce => "announce",
+            ServiceTask::Catalog => "catalog", ServiceTask::Exchange => "exchange",
+        }, error, delay);
         self.manual_until = None;
+        self.manual_queued = None;
         // No confirmed daily quota classifier: do not stop control heartbeats.
         if error != Error::Busy {
             self.verification.extend(self.schedule.peers.keys().cloned());
@@ -507,11 +548,19 @@ impl Actor {
         }
     }
     fn metadata_call(&mut self, op: Op, call: Call, deadline: Instant) {
+        self.metadata_submitted(op, call, deadline, None);
+    }
+    fn metadata_submitted(&mut self, op: Op, call: Call, deadline: Instant, first: Option<PendingHttp>) {
         self.announcing = matches!(&op, Op::Announce(_));
         self.meta = Some(Box::pin(async move {
             let mut delay = Duration::from_millis(250);
+            let mut first = first;
             let result = loop {
-                match call.execute().await {
+                let result = match first.take() {
+                    Some(pending) => call.complete(pending).await,
+                    None => call.execute().await,
+                };
+                match result {
                     Err(Error::Busy | Error::Closed) if Instant::now() + delay < deadline => {
                         tokio::time::sleep(delay).await;
                         delay = (delay * 2).min(Duration::from_secs(1));
@@ -708,6 +757,7 @@ impl Actor {
                     match op {
                         Op::Wake(_, _, intent) => match intent.response(bytes)? {
                             WakeResult::Accepted(wake) => {
+                                self.attempts[&id].trace.event("wake_accepted", None, 0);
                                 self.attempts.get_mut(&id).unwrap().wake = Some(wake)
                             }
                             WakeResult::Current(_) => {
@@ -719,6 +769,7 @@ impl Actor {
                         Op::Ready(_, _, boot) => {
                             let context = self.attempt_context(&id, &boot)?;
                             metadata::ready_response(bytes, &context)?;
+                            self.attempts[&id].trace.event("ready_accepted", None, 0);
                             self.attempts.get_mut(&id).unwrap().ready_boot = Some(boot);
                         }
                         Op::Open(_, _) => {
@@ -729,6 +780,7 @@ impl Actor {
                                 Instant::now(),
                             )?;
                             a.offered = true;
+                            a.trace.event("declaration_accepted", None, 0);
                             if let Some(tls) = tls {
                                 self.install_tls(&id, tls)?;
                             }
@@ -786,6 +838,7 @@ impl Actor {
         }
         let session = self.activity.as_mut().unwrap().add(tls)?;
         let attempt = self.attempts.remove(id).ok_or(Error::Cancelled)?;
+        attempt.trace.event("declarations_complete", None, 0);
         self.connected.insert(
             id.into(),
             Connected {
@@ -796,6 +849,7 @@ impl Actor {
                 link: None,
                 finished: false,
                 closing_at: None,
+                trace: attempt.trace,
             },
         );
         Ok(())
@@ -818,6 +872,9 @@ impl Actor {
         if a.waiting_poll {
             return Ok(());
         }
+        if a.passive_boot.as_ref().is_some_and(|expected| expected != &boot) {
+            return Err(Error::RelaySessionLost);
+        }
         if announcement.membership != a.peer.remote_membership_id
             || announcement.instance != a.instance
         {
@@ -830,9 +887,13 @@ impl Actor {
         let wake = item
             .wake
             .as_ref()
-            .filter(|w| w.expires_at > now() && !self.seen_wakes.contains(id, &w.id, now()))
+            .filter(|w| w.expires_at > now() && (!self.seen_wakes.contains(id, &w.id, now())
+                || (a.passive_boot.as_deref() == Some(&boot) && a.wake.as_deref() == Some(&w.id))))
             .filter(|_| item.handshake.as_ref().is_some_and(|h| !h.closed));
         if a.wake.is_none() {
+            if a.passive_boot.is_some() {
+                return Err(Error::RelaySessionLost);
+            }
             if let Some(wake) = wake {
                 // An old instance wake is unusable, but its ID remains the CAS
                 // precondition when making a fresh intent below.
@@ -920,6 +981,11 @@ impl Actor {
             self.forced.remove(id);
             self.verification.remove(id);
             self.service_ok(ServiceTask::Exchange);
+            self.recovery.remove(id);
+            self.manual_queued = None;
+            if let Some(c) = self.connected.get(id) {
+                c.trace.event("completed", None, 0);
+            }
         }
         if result.completed > 0
             || (result.failures.is_empty()
@@ -939,11 +1005,15 @@ impl Actor {
         }
         if !result.failures.is_empty() || result.omitted > 0 {
             self.schedule.failed(id, now());
+            // An incomplete content result is not evidence for bypassing any
+            // backoff; retain the spent credit, but remove the old error hint.
+            self.record_failure(id, Error::InvalidResource);
         } else if result.more {
             if let Some(p) = self.schedule.peers.get_mut(id) {
                 p.needed = true;
             }
             self.schedule.occupied(id, now());
+            self.record_failure(id, Error::Busy);
         }
         if let Some(c) = self.connected.get_mut(id) {
             c.finished = true;
@@ -1010,6 +1080,7 @@ impl Actor {
                     refs.push(Arc::downgrade(&link.connection));
                 }
                 self.connected.get_mut(&id).unwrap().link = Some(link);
+                self.connected[&id].trace.event("tls_connected", None, 0);
                 self.schedule.connected(&id, now());
                 self.emit(Notice::Connected(id));
             }
@@ -1054,6 +1125,9 @@ impl Actor {
     fn tick(&mut self) -> Result<()> {
         self.sync_epoch();
         let at = now();
+        if self.admission_at.is_some_and(|deadline| at >= deadline) {
+            self.admission_at = None;
+        }
         if !(self.authorized())() {
             return Ok(());
         }
@@ -1098,7 +1172,18 @@ impl Actor {
                 FileDone::Confirmed(outbox.complete(&intent, receipt, now(), &cancel).await)
             }));
         }
-        if at < self.service_retry() {
+        let active_allowed = at >= self.service_retry();
+        // A read has its own permission. In particular it can complete while
+        // FileIo is waiting, or an ordinary exchange is backing off.
+        if !active_allowed || self.file.is_some() {
+            self.due_poll(at)?;
+        }
+        let passive_allowed = at >= self.passive_retry() && (
+            self.attempts.values().any(|a| a.passive_boot.is_some())
+            || self.connected.values().any(|c| !c.finished && c.trace.passive)
+            || self.schedule.peers.keys().any(|id| self.passive_candidate(id, at))
+        );
+        if !active_allowed && !passive_allowed {
             return Ok(());
         }
         if self.file.is_none() && self.needs_refresh && !self.opening_or_syncing() {
@@ -1107,6 +1192,7 @@ impl Actor {
         // A pending refresh/outbox write cannot be bypassed by a newly started
         // round. Existing Activity keeps moving concurrently with this owner.
         if self.file.is_some() {
+            self.due_poll(at)?;
             return Ok(());
         }
         if self.manual_until == Some(u64::MAX) {
@@ -1127,9 +1213,7 @@ impl Actor {
                 }
             }
         }
-        if self.meta.is_none() && at >= self.poll_at {
-            self.start_poll()?;
-        }
+        self.due_poll(at)?;
         // An in-flight announcement has left pending but is not yet confirmed.
         // Opening now would block its FileIo confirmation behind that attempt,
         // while the attempt itself waits for confirmation: neither could run.
@@ -1178,46 +1262,23 @@ impl Actor {
             if self.attempts.len() + self.connected.len() >= 4 {
                 break;
             }
-            let Some(item) = self.item(&id) else { continue };
-            let Some(a) = item.announcement else { continue };
-            let peer = self
-                .authority
-                .read()
-                .map_err(|_| Error::Runtime)?
-                .peer(&id)?;
-            if a.membership != peer.remote_membership_id {
-                continue;
-            }
-            if a.peer_version != super::PEER_VERSION {
-                self.schedule.failed(&id, at);
-                self.emit(Notice::Error(id, Error::ProtocolVersion));
-                continue;
-            }
-            self.attempts.insert(
-                id.clone(),
-                Attempt {
-                    tag: uuid::Uuid::new_v4().to_string(),
-                    peer,
-                    instance: a.instance,
-                    until: at + ACTIVE_MS,
-                    polls: 0,
-                    wake: None,
-                    nonce: uuid::Uuid::new_v4().to_string(),
-                    ready_boot: None,
-                    handshake: None,
-                    offered: false,
-                    waiting_poll: false,
-                    tls: None,
-                    cancel: Cancellation::default(),
+            let passive = at < self.schedule.peers[&id].retry_at || !active_allowed;
+            if passive && self.admission_at.is_some() { continue; }
+            match self.start_attempt(&id, at) {
+                Ok(()) => {},
+                Err(Error::Busy) if passive && self.meta.is_none() => {
+                    self.admission_at = Some(at + POLL_MS);
                 },
-            );
-            self.schedule.busy(&id, at);
-            self.poll_at = self.poll_at.min(at + POLL_MS);
-            self.emit(Notice::Connecting(id));
+                Err(Error::Busy) => {},
+                Err(e) => self.fail(&id, e),
+            }
         }
         if self.meta.is_none() {
             let ids: Vec<_> = self.attempts.keys().cloned().collect();
             for id in ids {
+                if !active_allowed && !(passive_allowed && self.attempts[&id].passive_boot.is_some()) {
+                    continue;
+                }
                 match self.drive_attempt(&id) {
                     Ok(()) | Err(Error::Busy) => {}
                     Err(e) => self.fail(&id, e),
@@ -1231,7 +1292,7 @@ impl Actor {
             if let Some((id, l)) = self
                 .connected
                 .iter()
-                .filter(|(id, c)| own < **id && !c.finished)
+                .filter(|(id, c)| own < **id && !c.finished && (active_allowed || (passive_allowed && c.trace.passive)))
                 .find_map(|(id, c)| c.link.as_ref().map(|l| (id.clone(), l.clone())))
             {
                 self.round = Some(Box::pin(async move {
@@ -1265,6 +1326,7 @@ impl Actor {
         for id in replaced {
             self.remove(&id);
             self.verification.remove(&id);
+            self.recovery.remove(&id);
             self.engine.forget_checkpoint(&id);
             self.forced.insert(id);
         }
@@ -1282,6 +1344,7 @@ impl Actor {
         for id in removed {
             self.remove(&id);
             self.verification.remove(&id);
+            self.recovery.remove(&id);
             self.engine.forget_checkpoint(&id);
             self.losses.remove(&id);
             self.forced.remove(&id);
@@ -1311,7 +1374,7 @@ impl Actor {
             let shutdown = self.context.shutdown.clone();
             // All deadlines are finite state deadlines, not a fast idle tick.
             let at = now();
-            let mut deadline = self.refresh_at.min(self.poll_at.max(self.service_retry()));
+            let mut deadline = self.next_work_deadline(at);
             if let Some(t) = self.schedule.changed_at {
                 deadline = deadline.min(t);
             }
@@ -1332,9 +1395,7 @@ impl Actor {
                 _=work.notified()=>{},
                 cmd=commands.recv()=>match cmd {
                     Some(Command::Members(a,_,_))=>self.members(a)?,
-                    Some(Command::Manual(epoch))=>{self.sync_epoch();if epoch==self.epoch {self.schedule.manual();self.forced.extend(self.schedule.peers.keys().cloned());
-                        self.engine.force_full_catalogs();
-                        self.cancelled_until=None;self.needs_refresh=true;for b in &mut self.service_backoff {b.until=0;}self.poll_at=now();self.losses.clear();self.manual_until=Some(u64::MAX);}},
+                    Some(Command::Manual(epoch))=>{self.sync_epoch();if epoch==self.epoch {self.manual();}},
                     Some(Command::Cancel)=>{self.work.cancel();self.sync_epoch();},None=>break,
                 },
                 result=optional(&mut self.file)=>{self.file=None;self.file_done(result);},

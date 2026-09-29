@@ -17,6 +17,7 @@ pub mod ember;
 mod integrations;
 mod orchestrator;
 mod pty;
+mod project_settings;
 mod tavern_invite;
 mod shell_switch;
 mod temporal_context;
@@ -532,14 +533,9 @@ struct ProjectAgentIdentityListing {
 struct TemporalContextPrepareRequest {
     #[serde(default)]
     project_root: Option<String>,
+    message_id: String,
+    timestamp: String,
     target_agent_ids: Vec<String>,
-    payload: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TemporalContextPreparedPrompt {
-    target_agent_id: String,
     payload: String,
 }
 
@@ -1571,37 +1567,30 @@ async fn agent_bus_retry_delivery(
 
 #[tauri::command]
 async fn temporal_context_prepare_composer(
+    app: AppHandle,
     manager: State<'_, IntegrationManager>,
     temporal_context: State<'_, TemporalContextManager>,
     request: TemporalContextPrepareRequest,
-) -> Result<Vec<TemporalContextPreparedPrompt>, String> {
+) -> Result<Vec<temporal_context::PreparedComposerPrompt>, String> {
     let project_root = resolve_project_root_for_listing(&manager, request.project_root.as_deref())?;
     let temporal_context = temporal_context.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let now = chrono::Local::now();
-        let mut seen = BTreeSet::new();
-        request
-            .target_agent_ids
-            .into_iter()
-            .filter_map(|target_agent_id| {
-                let target_agent_id = target_agent_id.trim().to_string();
-                if target_agent_id.is_empty() || !seen.insert(target_agent_id.clone()) {
-                    return None;
-                }
-                Some(TemporalContextPreparedPrompt {
-                    payload: temporal_context.prepare_payload_best_effort(
-                        &project_root,
-                        &target_agent_id,
-                        &request.payload,
-                        now,
-                    ),
-                    target_agent_id,
-                })
-            })
-            .collect()
+    let root = project_root.clone();
+    let (prepared, changed) = tauri::async_runtime::spawn_blocking(move || {
+        temporal_context.prepare_composer(
+            &root,
+            &request.message_id,
+            &request.timestamp,
+            &request.target_agent_ids,
+            &request.payload,
+            chrono::Local::now(),
+        )
     })
     .await
-    .map_err(|err| format!("temporal context task panicked: {err}"))
+    .map_err(|err| format!("temporal context task panicked: {err}"))??;
+    if !changed.is_empty() {
+        violet::emit_room_changed(&app, &project_root, "composer-temporal", changed);
+    }
+    Ok(prepared)
 }
 
 #[tauri::command]
@@ -1862,12 +1851,33 @@ async fn violet_room_sync(
 }
 
 #[tauri::command]
-fn violet_room_read_cache(
+async fn violet_room_read_cache(
     manager: State<'_, IntegrationManager>,
     request: violet::VioletRoomRequest,
 ) -> Result<violet::VioletRoomState, String> {
+    if request.around.is_some()
+        && request.project_root.as_deref().is_none_or(|root| root.trim().is_empty())
+    {
+        return Err("Room preview requires projectRoot".into());
+    }
     let project_root = resolve_project_root_for_listing(&manager, request.project_root.as_deref())?;
-    violet::read_cache(&project_root, request)
+    tauri::async_runtime::spawn_blocking(move || violet::read_cache(&project_root, request))
+        .await
+        .map_err(|err| format!("join Violet room cache task: {err}"))?
+}
+
+#[tauri::command]
+async fn violet_room_search(
+    request: violet::VioletRoomSearchRequest,
+) -> Result<violet::VioletRoomSearchResult, String> {
+    let root = request.project_root.trim();
+    if root.is_empty() {
+        return Err("Room search requires projectRoot".into());
+    }
+    let project_root = PathBuf::from(root);
+    tauri::async_runtime::spawn_blocking(move || violet::search_room(&project_root, request))
+        .await
+        .map_err(|err| format!("join Violet room search task: {err}"))?
 }
 
 #[tauri::command]
@@ -10031,7 +10041,7 @@ async fn pty_nl_translate(
 //   I-4 reuses pty/smart.rs's portable-pty + alacritty_terminal infra
 //   I-5 zero protocol parsing — frontend just renders ANSI
 //   I-15 path env vars include KOTA_PROJECT_MEMORY_DIR and KOTA_PROJECT_RULES_DIR
-//   I-26 GIT_AUTHOR_EMAIL = "{agent_id}@kota.local"
+//   I-26 default GIT_AUTHOR_EMAIL = "{agent_id}@kota.local" (project override optional)
 
 #[tauri::command]
 async fn pty_agent_spawn(
@@ -11227,6 +11237,48 @@ async fn workspace_list_projects(
     })
     .await
     .map_err(|err| format!("join workspace_list_projects: {err}"))?
+}
+
+fn project_settings_root(manager: &IntegrationManager, project_id: String) -> Result<PathBuf, String> {
+    // Resolve a registered workspace, not an arbitrary filesystem path supplied by the UI.
+    let project_id = project_id.trim();
+    let mut components = Path::new(project_id).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+        || project_id.contains(['/', '\\'])
+    {
+        return Err("Invalid project id".into());
+    }
+    manager
+        .project_settings_root(project_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn project_settings_read(
+    app: AppHandle,
+    project_id: String,
+) -> Result<project_settings::ProjectSettings, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = project_settings_root(&app.state::<IntegrationManager>(), project_id)?;
+        project_settings::read(&root).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("join project_settings_read: {error}"))?
+}
+
+#[tauri::command]
+async fn project_settings_save_commit_email(
+    app: AppHandle,
+    project_id: String,
+    commit_email: Option<String>,
+) -> Result<project_settings::ProjectSettings, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = project_settings_root(&app.state::<IntegrationManager>(), project_id)?;
+        project_settings::save_commit_email(&root, commit_email).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("join project_settings_save_commit_email: {error}"))?
 }
 
 #[tauri::command]
@@ -13215,11 +13267,14 @@ pub fn run() {
             bartender_route_pull_conflict,
             violet_room_sync,
             violet_room_read_cache,
+            violet_room_search,
             violet_summary_status,
             violet_summary_now,
             violet_summary_auto_run,
             violet_privacy_set,
             workspace_list_projects,
+            project_settings_read,
+            project_settings_save_commit_email,
             workspace_open_project,
             workspace_resolve_agent_launch,
             workspace_list_tree_path,

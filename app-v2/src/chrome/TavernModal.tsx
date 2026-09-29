@@ -145,12 +145,7 @@ import iconGhost from '../assets/tavern/icons/ghost.svg';
 import iconShell from '../assets/tavern/icons/shell.svg';
 import iconSkills from '../assets/tavern/icons/skills.svg';
 import iconTurns from '../assets/tavern/icons/turns.svg';
-import providerIconAntigravity from '../assets/tavern/icons/providers/googlegemini.svg';
-import providerIconClaude from '../assets/tavern/icons/providers/claude.svg';
-import providerIconCodex from '../assets/tavern/icons/providers/openai.svg';
-import providerIconKimi from '../assets/tavern/icons/providers/kimi.svg';
-import providerIconOpencode from '../assets/tavern/icons/providers/opencode.svg';
-import providerIconPi from '../assets/tavern/icons/providers/pi.svg';
+import { PROVIDER_ICONS, type ProviderId } from '../lib/provider-icons';
 import { LaughingManSettings } from './LaughingManSettings';
 
 interface TavernModalProps {
@@ -166,7 +161,6 @@ interface TavernModalProps {
 export type TavernTab = 'heroes' | 'rules' | 'skills' | 'link' | 'archived';
 const SHOW_GOOGLE_DRIVE_CARD = false;
 const TAVERN_TABS: TavernTab[] = ['heroes', 'rules', 'skills', 'link', 'archived'];
-type ProviderId = 'claude' | 'codex' | 'antigravity' | 'opencode' | 'pi' | 'kimi';
 export type AgentCardKind = 'invited' | 'custom';
 type SystemHeroId = 'magi' | 'violet' | 'ember' | 'bbs' | 'laughing-man' | 'puppeteer' | 'bartender';
 type ProfileTarget =
@@ -474,27 +468,27 @@ function nextTavernPaint(): Promise<void> {
 const PROVIDERS: Record<ProviderId, ProviderSpec> = {
   claude: {
     id: 'claude',
-    name: 'Claude Code',
+    name: PROVIDER_ICONS.claude.label,
     cli: 'claude',
-    icon: providerIconClaude,
+    icon: PROVIDER_ICONS.claude.svg,
     installUrl: 'https://docs.anthropic.com/en/docs/claude-code/setup',
     defaultModel: 'default',
     defaultAvatarId: 'claude',
   },
   codex: {
     id: 'codex',
-    name: 'Codex',
+    name: PROVIDER_ICONS.codex.label,
     cli: 'codex',
-    icon: providerIconCodex,
+    icon: PROVIDER_ICONS.codex.svg,
     installUrl: 'https://github.com/openai/codex',
     defaultModel: 'default',
     defaultAvatarId: 'codex',
   },
   antigravity: {
     id: 'antigravity',
-    name: 'Antigravity CLI',
+    name: PROVIDER_ICONS.antigravity.label,
     cli: 'agy',
-    icon: providerIconAntigravity,
+    icon: PROVIDER_ICONS.antigravity.svg,
     installUrl: 'https://www.antigravity.google/docs/cli/cli-getting-started',
     defaultModel: 'default',
     defaultAvatarId: 'antigravity',
@@ -502,9 +496,9 @@ const PROVIDERS: Record<ProviderId, ProviderSpec> = {
   },
   opencode: {
     id: 'opencode',
-    name: 'OpenCode',
+    name: PROVIDER_ICONS.opencode.label,
     cli: 'opencode',
-    icon: providerIconOpencode,
+    icon: PROVIDER_ICONS.opencode.svg,
     installUrl: 'https://opencode.ai/docs',
     defaultModel: 'default',
     defaultAvatarId: 'opencode',
@@ -512,9 +506,9 @@ const PROVIDERS: Record<ProviderId, ProviderSpec> = {
   },
   pi: {
     id: 'pi',
-    name: 'Pi',
+    name: PROVIDER_ICONS.pi.label,
     cli: 'pi',
-    icon: providerIconPi,
+    icon: PROVIDER_ICONS.pi.svg,
     installUrl: 'https://pi.dev',
     defaultModel: 'default',
     defaultAvatarId: 'pi',
@@ -522,9 +516,9 @@ const PROVIDERS: Record<ProviderId, ProviderSpec> = {
   },
   kimi: {
     id: 'kimi',
-    name: 'Kimi Code',
+    name: PROVIDER_ICONS.kimi.label,
     cli: 'kimi',
-    icon: providerIconKimi,
+    icon: PROVIDER_ICONS.kimi.svg,
     installUrl: 'https://code.kimi.com/',
     defaultModel: 'default',
     defaultAvatarId: 'kimi',

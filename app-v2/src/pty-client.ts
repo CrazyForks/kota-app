@@ -1078,6 +1078,20 @@ export interface WorkspaceStatus {
   active: WorkspaceProject | null;
 }
 
+export interface ProjectSettingsValue {
+  commitEmail: string | null;
+}
+
+export async function readProjectSettings(projectId: string): Promise<ProjectSettingsValue> {
+  if (!useTauriRuntime()) throw new Error('Project settings require the Kota runtime.');
+  return invoke<ProjectSettingsValue>('project_settings_read', { projectId });
+}
+
+export async function saveProjectCommitEmail(projectId: string, commitEmail: string | null): Promise<ProjectSettingsValue> {
+  if (!useTauriRuntime()) throw new Error('Project settings require the Kota runtime.');
+  return invoke<ProjectSettingsValue>('project_settings_save_commit_email', { projectId, commitEmail });
+}
+
 export interface BartenderDirtyAgent {
   agentId: string;
   path: string;
@@ -1226,13 +1240,23 @@ export interface AgentBusSendResult {
 
 export interface TemporalContextPrepareRequest {
   projectRoot?: string | null;
+  messageId: string;
+  timestamp: string;
   targetAgentIds: string[];
   payload: string;
+}
+
+export interface ComposerTemporalGap {
+  currentTime: string;
+  prompt: string;
+  targetAgentIds: string[];
+  elapsedDaysByTarget?: Record<string, number>;
 }
 
 export interface TemporalContextPreparedPrompt {
   targetAgentId: string;
   payload: string;
+  temporalGap?: ComposerTemporalGap | null;
 }
 
 export interface AgentBusRetryDeliveryRequest {
@@ -1457,11 +1481,14 @@ export interface VioletChatMessage {
   nativeEventId?: string | null;
   violetSeq?: number | null;
   actorIntent?: string | null;
+  temporalGap?: ComposerTemporalGap | null;
   messageOrigin?: string | null;
   targetAgentIds?: string[];
   agentDisplayName?: string | null;
   agentAvatarId?: string | null;
   agentProvider?: string | null;
+  model?: string | null;
+  effort?: string | null;
   agentStatus?: string | null;
 }
 
@@ -1486,6 +1513,23 @@ export interface VioletRoomState {
   rawLogDir: string;
   chathistoryDir: string;
   syncedAt: string;
+  resolvedTargetId?: string;
+}
+
+export interface VioletRoomSearchRequest {
+  projectRoot: string;
+  query: string;
+  humanOnly: boolean;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface VioletRoomSearchResult {
+  hits: VioletChatMessage[];
+  matchTerms: string[];
+  total?: number;
+  nextCursor?: string;
+  truncated: boolean;
 }
 
 export interface AgentBusReceipt {
@@ -1500,6 +1544,7 @@ export interface VioletRoomRequest {
   before?: string | null;
   agentIds?: string[] | null;
   watchAgentIds?: string[] | null;
+  around?: { id: string; before: number; after: number };
 }
 
 export interface VioletRoomChangedEvent {
@@ -3113,10 +3158,19 @@ export async function readVioletRoomCache(
   request: VioletRoomRequest = {},
 ): Promise<VioletRoomState> {
   if (!useTauriRuntime()) {
+    // Preview must never enter the room sync/emission path, including browser mode.
+    if (request.around) throw new Error('Message context is available in the desktop app.');
     return syncVioletRoom(request);
   }
   const state = await invoke<VioletRoomState>('violet_room_read_cache', { request });
   return state;
+}
+
+export async function searchVioletRoom(request: VioletRoomSearchRequest): Promise<VioletRoomSearchResult> {
+  if (!useTauriRuntime()) {
+    return { hits: [], matchTerms: [], total: 0, truncated: false };
+  }
+  return invoke<VioletRoomSearchResult>('violet_room_search', { request });
 }
 
 export async function onVioletRoomSynced(

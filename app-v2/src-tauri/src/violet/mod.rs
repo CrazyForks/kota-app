@@ -1,7 +1,8 @@
 //! Violet — native-log normalizer + room chat reader.
 //!
-//! This MVP deliberately uses provider-native logs as the only content
-//! source. `project-memory/raw_logs/` is normally an output cache; actor bus
+//! Provider-native logs supply transcript content. Cross-day composer sends
+//! also persist their clean originals directly. `project-memory/raw_logs/`
+//! is normally an output cache; actor bus
 //! raw logs are replayed as a repair source because those messages originate in
 //! Kota rather than in provider-native transcripts.
 
@@ -31,6 +32,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration as StdDuration, Instant, SystemTime};
 use tauri::{AppHandle, Emitter};
+
+mod room_search;
+pub use room_search::{search_room, VioletRoomAround, VioletRoomSearchRequest, VioletRoomSearchResult};
 
 const ROOM_LIMIT_DEFAULT: usize = 200;
 const SOURCE_EVENT_LIMIT: usize = 120;
@@ -122,6 +126,8 @@ pub struct VioletRoomRequest {
     pub limit: Option<usize>,
     #[serde(default)]
     pub before: Option<String>,
+    #[serde(default)]
+    pub around: Option<VioletRoomAround>,
     #[serde(default)]
     pub agent_ids: Option<Vec<String>>,
     #[serde(default)]
@@ -299,6 +305,8 @@ struct EmberDreamEntryRecord {
 #[serde(rename_all = "camelCase")]
 pub struct VioletRoomState {
     pub messages: Vec<VioletChatMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_target_id: Option<String>,
     pub sources: Vec<VioletSourceStatus>,
     #[serde(default)]
     pub work_events: Vec<AgentWorkEvent>,
@@ -327,6 +335,8 @@ pub struct VioletChatMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_intent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal_gap: Option<crate::temporal_context::ComposerTemporalGap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_origin: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_agent_ids: Vec<String>,
@@ -336,6 +346,10 @@ pub struct VioletChatMessage {
     pub agent_avatar_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_status: Option<String>,
 }
@@ -448,6 +462,10 @@ enum RoomExceptionReshape {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct NativeEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     shell_handoff: Option<crate::shell_switch::ProjectedHandoff>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     handoff_bus_id: Option<String>,
@@ -497,6 +515,8 @@ struct ChathistoryEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     actor_intent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    temporal_gap: Option<crate::temporal_context::ComposerTemporalGap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     message_origin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_display_name: Option<String>,
@@ -504,6 +524,10 @@ struct ChathistoryEvent {
     agent_avatar_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_status: Option<String>,
 }
@@ -593,6 +617,74 @@ struct SourceCursor {
     offset: u64,
     line_index: usize,
     updated_at: String,
+    // Carry only observed native values across incremental reads. Old cursors
+    // default to unknown; do not replay frozen history to backfill captions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MessageModel {
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+impl MessageModel {
+    fn apply(&self, event: &mut NativeEvent) {
+        if event.role == "assistant" && event.kind == "message" {
+            event.model = self.model.clone();
+            event.effort = self.effort.clone();
+        }
+    }
+
+    fn observe_jsonl(&mut self, shell: &str, json: &JsonValue) {
+        match (shell, json.get("type").and_then(JsonValue::as_str)) {
+            ("codex", Some("turn_context")) => {
+                self.model = json_string(json, &["payload", "model"]);
+                self.effort = json_string(json, &["payload", "effort"]);
+            }
+            ("kimi", Some("llm.request")) => {
+                self.model = json_string(json, &["model"]);
+                self.effort = json_string(json, &["thinkingEffort"]);
+            }
+            ("antigravity", Some("USER_INPUT")) => {
+                if let Some(text) = json.get("content").and_then(text_from_json) {
+                    if text.contains("<USER_SETTINGS_CHANGE>") {
+                        *self = antigravity_message_model(&text).unwrap_or_default();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn antigravity_message_model(text: &str) -> Option<MessageModel> {
+    let change = extract_tag_block(text, "USER_SETTINGS_CHANGE")?.trim();
+    let (_, label) = change
+        .strip_prefix("The user changed setting `Model Selection` from ")?
+        .split_once(" to ")?;
+    // A decimal point in e.g. "Gemini 3.8" is not the sentence terminator.
+    let end = label.char_indices().find_map(|(index, ch)| {
+        (ch == '.' && label[index + 1..].chars().next().is_none_or(char::is_whitespace))
+            .then_some(index)
+    })?;
+    let label = label[..end].trim();
+    if label.is_empty() {
+        return None;
+    }
+    let (model, effort) = label
+        .strip_suffix(')')
+        .and_then(|label| label.rsplit_once(" ("))
+        .map_or((label, None), |(model, effort)| {
+            (model, Some(effort.to_string()))
+        });
+    Some(MessageModel {
+        model: Some(model.to_string()),
+        effort,
+    })
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -769,6 +861,7 @@ pub fn sync_project(
 
     Ok(VioletRoomState {
         messages,
+        resolved_target_id: None,
         sources,
         work_events,
         agent_bus_receipts,
@@ -784,10 +877,17 @@ pub fn read_cache(
 ) -> Result<VioletRoomState, String> {
     let raw_log_dir = project_root.join("project-memory").join("raw_logs");
     let chathistory_dir = chathistory_dir(project_root);
-    let messages = read_room_messages(project_root, &request)?;
+    let (messages, resolved_target_id) = match request.around.as_ref() {
+        Some(around) => {
+            let (messages, target) = room_search::read_around(project_root, around)?;
+            (messages, Some(target))
+        }
+        None => (read_room_messages(project_root, &request)?, None),
+    };
 
     Ok(VioletRoomState {
         messages,
+        resolved_target_id,
         sources: Vec::new(),
         work_events: Vec::new(),
         agent_bus_receipts: Vec::new(),
@@ -920,6 +1020,7 @@ pub fn consolidate_ember_dreams(
                 limit: Some(1),
                 before: None,
                 agent_ids: None,
+                around: None,
                 watch_agent_ids: None,
             },
         );
@@ -1005,6 +1106,40 @@ pub fn set_privacy(project_root: &Path, request: VioletPrivacyRequest) -> Result
     fs::write(&path, out).map_err(|err| format!("write {}: {err}", path.display()))
 }
 
+pub(crate) fn record_composer_temporal_message(
+    project_root: &Path,
+    message_id: &str,
+    timestamp: &str,
+    text: &str,
+    target_agent_ids: &[String],
+    temporal_gap: &crate::temporal_context::ComposerTemporalGap,
+) -> Result<Vec<PathBuf>, String> {
+    let message = VioletChatMessage {
+        id: message_id.to_string(),
+        session_id: "composer".into(),
+        agent_id: "user".into(),
+        shell: "composer".into(),
+        role: "user".into(),
+        kind: "message".into(),
+        timestamp: timestamp.to_string(),
+        text: text.to_string(),
+        source_path: None,
+        native_event_id: Some(message_id.to_string()),
+        violet_seq: None,
+        actor_intent: None,
+        temporal_gap: Some(temporal_gap.clone()),
+        message_origin: None,
+        target_agent_ids: target_agent_ids.to_vec(),
+        agent_display_name: None,
+        agent_avatar_id: None,
+        agent_provider: None,
+        model: None,
+        effort: None,
+        agent_status: None,
+    };
+    write_chathistory_messages(project_root, &[message])
+}
+
 pub fn record_actor_message(
     project_root: &Path,
     record: &ActorMessageRecord,
@@ -1045,6 +1180,9 @@ pub fn record_actor_message(
     let raw_path = raw_dir.join(format!("{session_id}.md"));
     append_text(&raw_path, &raw_block)?;
     let message = VioletChatMessage {
+        temporal_gap: None,
+        model: None,
+        effort: None,
         id: stable_message_id(&session_id, &record.actor_id, &timestamp, &record.text),
         session_id,
         agent_id: record.actor_id.clone(),
@@ -3430,10 +3568,22 @@ fn parse_pi_source(
         });
     }
 
-    let mut events = pi_active_path_entries(&entries)
-        .into_iter()
-        .flat_map(|entry| parse_pi_entry(agent, source, entry))
-        .collect::<Vec<_>>();
+    let mut events = Vec::new();
+    let mut effort = None;
+    for entry in pi_active_path_entries(&entries) {
+        if json_string(&entry.json, &["type"]).as_deref() == Some("thinking_level_change") {
+            effort = json_string(&entry.json, &["thinkingLevel"]);
+        }
+        let mut parsed = parse_pi_entry(agent, source, entry);
+        let caption = MessageModel {
+            model: json_string(&entry.json, &["message", "model"]),
+            effort: effort.clone(),
+        };
+        for event in &mut parsed {
+            caption.apply(event);
+        }
+        events.extend(parsed);
+    }
     events = dedupe_native_events(events);
     events.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
     Ok(tail_events(events, SOURCE_EVENT_LIMIT * 4))
@@ -3742,6 +3892,14 @@ where
         .as_ref()
         .filter(|_| cursor_matches)
         .map_or(0, |cursor| cursor.line_index);
+    let mut message_model = cursor
+        .as_ref()
+        .filter(|_| cursor_matches)
+        .map(|cursor| MessageModel {
+            model: cursor.model.clone(),
+            effort: cursor.effort.clone(),
+        })
+        .unwrap_or_default();
     let read = if reset_cache {
         read_jsonl_tail(&source.path, file_len, tail_bytes)?
     } else {
@@ -3767,7 +3925,14 @@ where
                 continue;
             }
         };
-        parsed_new.extend(parser(agent, source, index, json));
+        message_model.observe_jsonl(&agent.shell, &json);
+        let mut events = parser(agent, source, index, json);
+        if matches!(agent.shell.as_str(), "codex" | "kimi" | "antigravity") {
+            for event in &mut events {
+                message_model.apply(event);
+            }
+        }
+        parsed_new.extend(events);
     }
     if !parsed_new.is_empty() {
         cached.extend(parsed_new);
@@ -3787,6 +3952,8 @@ where
             offset: next_offset,
             line_index: next_line_index,
             updated_at: now_iso(),
+            model: message_model.model,
+            effort: message_model.effort,
         },
     )?;
     Ok(tail_events(cached, SOURCE_EVENT_LIMIT * 4))
@@ -4033,12 +4200,18 @@ fn parse_claude_line(
     }
     // Claude's typed-input wrapper is transport syntax, regardless of the
     // message inside. Normalize once before the existing classification paths.
+    // Claude stamps input submitted mid-turn as `queued` instead of `typed`;
+    // both are the same human composer path and carry the same wrapper.
+    // Inputs coalesced from several pastes keep one wrapper per paste, so
+    // each wrapper becomes its own block and is classified on its own.
     let normalized = (role == "user"
         && json_string(&json, &["origin", "kind"]).as_deref() == Some("human")
-        && json_string(&json, &["promptSource"]).as_deref() == Some("typed"))
-    .then(|| content.as_str().and_then(claude_pasted_input))
-    .flatten()
-    .map(|text| JsonValue::String(text.to_owned()));
+        && matches!(
+            json_string(&json, &["promptSource"]).as_deref(),
+            Some("typed" | "queued")
+        ))
+    .then(|| normalize_claude_pasted_content(content))
+    .flatten();
     let content = normalized.as_ref().unwrap_or(content);
     let mut events = content_blocks_to_events(agent, source, &role, &timestamp, &event_id, content)
         .into_iter()
@@ -4105,6 +4278,13 @@ fn parse_claude_line(
                 event.turn_id = turn_id.clone();
             }
         }
+    }
+    let caption = MessageModel {
+        model: json_string(&json, &["message", "model"]).filter(|model| model != "<synthetic>"),
+        effort: json_string(&json, &["effort"]),
+    };
+    for event in &mut events {
+        caption.apply(event);
     }
     events
 }
@@ -4210,8 +4390,71 @@ fn parse_claude_hook_line(
     vec![event]
 }
 
+/// Unwraps Claude's `<pasted_content>` transport wrapper from a human input.
+/// A string input must be wrappers only. In block input (an attached image
+/// plus text) the text block may carry provider attachment markers before the
+/// wrappers; those marker bytes stay on the first unwrapped body, as elsewhere.
+/// Returns `None` when nothing was wrapped, so the input keeps its native shape.
+fn normalize_claude_pasted_content(content: &JsonValue) -> Option<JsonValue> {
+    fn text_block(text: &str) -> JsonValue {
+        serde_json::json!({"type": "text", "text": text})
+    }
+    match content {
+        JsonValue::String(text) => Some(match claude_pasted_inputs(text)?.as_slice() {
+            [body] => JsonValue::String((*body).to_owned()),
+            bodies => JsonValue::Array(bodies.iter().map(|body| text_block(body)).collect()),
+        }),
+        JsonValue::Array(items) => {
+            let mut changed = false;
+            let mut blocks = Vec::with_capacity(items.len());
+            for item in items {
+                let text = (json_string(item, &["type"]).as_deref() == Some("text"))
+                    .then(|| json_string(item, &["text"]))
+                    .flatten();
+                let Some(text) = text else {
+                    blocks.push(item.clone());
+                    continue;
+                };
+                let candidate = strip_leading_provider_attachment_prefix(&text);
+                let Some(bodies) = claude_pasted_inputs(candidate) else {
+                    blocks.push(item.clone());
+                    continue;
+                };
+                changed = true;
+                let markers = &text[..text.len() - candidate.len()];
+                blocks.push(text_block(&format!("{markers}{}", bodies[0])));
+                blocks.extend(bodies[1..].iter().map(|body| text_block(body)));
+            }
+            changed.then_some(JsonValue::Array(blocks))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
 fn claude_pasted_input(text: &str) -> Option<&str> {
-    let rest = text.trim().strip_prefix("<pasted_content id=\"")?;
+    match claude_pasted_inputs(text)?.as_slice() {
+        [body] => Some(body),
+        _ => None,
+    }
+}
+
+/// Inner bytes of a Claude input that is exactly one or more complete
+/// `<pasted_content>` wrappers separated by nothing but whitespace. Anything
+/// else around or between the wrappers leaves the input unnormalized.
+fn claude_pasted_inputs(text: &str) -> Option<Vec<&str>> {
+    let mut rest = text.trim();
+    let mut bodies = Vec::new();
+    while !rest.is_empty() {
+        let (body, trailing) = claude_pasted_wrapper(rest)?;
+        bodies.push(body);
+        rest = trailing.trim_start();
+    }
+    (!bodies.is_empty()).then_some(bodies)
+}
+
+fn claude_pasted_wrapper(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix("<pasted_content id=\"")?;
     let (id, rest) = rest.split_once("\">\n")?;
     if id.is_empty()
         || id.chars().any(|ch| {
@@ -4224,7 +4467,7 @@ fn claude_pasted_input(text: &str) -> Option<&str> {
     // for one wrapper. Inner bytes are neither trimmed nor decoded.
     let close = format!("\n</pasted_content id=\"{id}\">");
     let (body, trailing) = rest.split_once(&close)?;
-    (!body.is_empty() && trailing.is_empty()).then_some(body)
+    (!body.is_empty()).then_some((body, trailing))
 }
 
 /// True when an assistant entry is pre-tool narration ("Let me check X…") rather than a
@@ -5169,6 +5412,10 @@ fn parse_opencode_sqlite(
             .or_else(|| millis_to_iso(created_millis))
             .unwrap_or_else(now_iso);
         let mut parts = load_opencode_sqlite_parts(&conn, &source.session_id, &message_id)?;
+        let caption = MessageModel {
+            model: json_string(&json, &["modelID"]),
+            effort: None,
+        };
         prepare_opencode_message_parts(&role, &json, &mut parts);
         if parts.is_empty() {
             if let Some(part) = opencode_message_error_part(&json) {
@@ -5197,6 +5444,7 @@ fn parse_opencode_sqlite(
                 event.work_signal = Some(signal);
             }
             event.stop_reason = part.reason;
+            caption.apply(&mut event);
             out.push(event);
         }
     }
@@ -5303,6 +5551,8 @@ fn opencode_permission_event_from_log_line(
     );
 
     Some(NativeEvent {
+        model: None,
+        effort: None,
         shell_handoff: None,
         handoff_bus_id: None,
         session_id: source.session_id.clone(),
@@ -5397,6 +5647,10 @@ fn parse_opencode_message_dir(
         let event_id = json_string(&json, &["id"])
             .unwrap_or_else(|| file_stem(&path).unwrap_or_else(|| source_session_id(&path)));
         let mut parts = load_opencode_parts(source.aux_path.as_deref(), &event_id)?;
+        let caption = MessageModel {
+            model: json_string(&json, &["modelID"]),
+            effort: None,
+        };
         prepare_opencode_message_parts(&role, &json, &mut parts);
         if parts.is_empty() {
             if let Some(part) = opencode_message_error_part(&json) {
@@ -5428,6 +5682,7 @@ fn parse_opencode_message_dir(
             if event.native_event_id.is_none() {
                 event.native_event_id = Some(format!("{event_id}:{index}"));
             }
+            caption.apply(&mut event);
             out.push(event);
         }
     }
@@ -5983,6 +6238,8 @@ fn event(
         _ => None,
     };
     NativeEvent {
+        model: None,
+        effort: None,
         shell_handoff,
         handoff_bus_id,
         session_id: source.session_id.clone(),
@@ -6032,6 +6289,8 @@ fn control_event(
     turn_id: Option<String>,
 ) -> NativeEvent {
     NativeEvent {
+        model: None,
+        effort: None,
         shell_handoff: None,
         handoff_bus_id: None,
         session_id: source.session_id.clone(),
@@ -6336,19 +6595,26 @@ fn sort_chathistory_events(events: &mut Vec<ChathistoryEvent>) {
     events.extend(prepared.into_iter().map(|(event, _)| event));
 }
 
+fn room_message_dedupe_key(message: &VioletChatMessage) -> String {
+    if message.temporal_gap.is_some() && message.agent_id == "user" {
+        return format!("composer:{}", message.id);
+    }
+    let normalized = one_line(&message.text).to_lowercase();
+    let bucket = DateTime::parse_from_rfc3339(&message.timestamp)
+        .map(|time| time.timestamp() / 120)
+        .unwrap_or(0);
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        message.agent_id, message.role, message.kind, bucket, normalized
+    )
+}
+
 fn dedupe_room_messages(mut messages: Vec<VioletChatMessage>) -> Vec<VioletChatMessage> {
     sort_room_messages(&mut messages);
     let mut seen = HashSet::new();
     let mut out = Vec::with_capacity(messages.len());
     for message in messages {
-        let normalized = one_line(&message.text).to_lowercase();
-        let bucket = DateTime::parse_from_rfc3339(&message.timestamp)
-            .map(|time| time.timestamp() / 120)
-            .unwrap_or(0);
-        let key = format!(
-            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
-            message.agent_id, message.role, message.kind, bucket, normalized
-        );
+        let key = room_message_dedupe_key(&message);
         if seen.insert(key) {
             out.push(message);
         }
@@ -8805,6 +9071,7 @@ fn chathistory_event_from_message(
         },
         target_agent_ids: message.target_agent_ids.clone(),
         actor_intent: message.actor_intent.clone(),
+        temporal_gap: message.temporal_gap.clone(),
         message_origin: message.message_origin.clone(),
         agent_display_name: message
             .agent_display_name
@@ -8818,6 +9085,8 @@ fn chathistory_event_from_message(
             .agent_provider
             .clone()
             .or_else(|| snapshot.and_then(|snapshot| snapshot.provider.clone())),
+        model: message.model.clone(),
+        effort: message.effort.clone(),
         agent_status: message
             .agent_status
             .clone()
@@ -8827,6 +9096,7 @@ fn chathistory_event_from_message(
 
 fn message_from_chathistory_event(event: ChathistoryEvent) -> VioletChatMessage {
     VioletChatMessage {
+        temporal_gap: event.temporal_gap,
         id: event.id,
         session_id: event.source.session_id,
         agent_id: event.agent_id,
@@ -8844,6 +9114,8 @@ fn message_from_chathistory_event(event: ChathistoryEvent) -> VioletChatMessage 
         agent_display_name: event.agent_display_name,
         agent_avatar_id: event.agent_avatar_id,
         agent_provider: event.agent_provider,
+        model: event.model,
+        effort: event.effort,
         agent_status: event.agent_status,
     }
 }
@@ -9257,6 +9529,9 @@ fn parse_normalized_block(block: &str, session_id: &str, path: &Path) -> Option<
     let agent_avatar_id = is_system_actor.then(|| agent_id.clone());
     let agent_provider = is_system_actor.then(|| "system".into());
     Some(VioletChatMessage {
+        temporal_gap: None,
+        model: None,
+        effort: None,
         id: stable_message_id(session_id, &agent_id, &timestamp, &text),
         session_id: session_id.to_string(),
         agent_id,
@@ -9294,6 +9569,7 @@ fn looks_like_legacy_tool_block(content: &str, metadata: &str) -> bool {
 
 fn event_to_message(event: NativeEvent) -> VioletChatMessage {
     VioletChatMessage {
+        temporal_gap: None,
         id: if event.message_origin.as_deref() == Some("shell_handoff") {
             stable_message_id("shell-handoff", &event.agent_id, "", event.native_event_id.as_deref().unwrap_or_default())
         } else {
@@ -9311,6 +9587,8 @@ fn event_to_message(event: NativeEvent) -> VioletChatMessage {
         violet_seq: None,
         actor_intent: None,
         message_origin: event.message_origin,
+        model: event.model,
+        effort: event.effort,
         target_agent_ids: Vec::new(),
         agent_display_name: None,
         agent_avatar_id: None,
@@ -10542,6 +10820,8 @@ mod tests {
 
     fn native_event(role: &str, kind: &str, text: &str) -> NativeEvent {
         NativeEvent {
+            model: None,
+            effort: None,
             shell_handoff: None,
             handoff_bus_id: None,
             session_id: "s".into(),
@@ -11485,6 +11765,9 @@ mod tests {
         text: &str,
     ) -> VioletChatMessage {
         VioletChatMessage {
+            temporal_gap: None,
+            model: None,
+            effort: None,
             id: id.into(),
             session_id: "s".into(),
             agent_id: "alice".into(),
@@ -11552,6 +11835,7 @@ mod tests {
                     limit: Some(100),
                     before: None,
                     agent_ids: None,
+                    around: None,
                     watch_agent_ids: None,
                 },
             )
@@ -11592,6 +11876,7 @@ mod tests {
                 limit: Some(10),
                 before: None,
                 agent_ids: None,
+                around: None,
                 watch_agent_ids: None,
             },
         )
@@ -11613,6 +11898,7 @@ mod tests {
                 limit: Some(10),
                 before: None,
                 agent_ids: None,
+                around: None,
                 watch_agent_ids: None,
             },
         )
@@ -12795,6 +13081,7 @@ done"#;
                 limit: Some(10),
                 before: None,
                 agent_ids: None,
+                around: None,
                 watch_agent_ids: None,
             },
         )
@@ -13219,6 +13506,7 @@ done"#;
                 limit: Some(30),
                 before: None,
                 agent_ids: None,
+                around: None,
                 watch_agent_ids: None,
             },
         )
@@ -13264,6 +13552,7 @@ done"#;
                 limit: Some(30),
                 before: None,
                 agent_ids: Some(vec!["alice".into()]),
+                around: None,
                 watch_agent_ids: None,
             },
         )
@@ -13320,6 +13609,7 @@ done"#;
                 limit: Some(30),
                 before: None,
                 agent_ids: Some(vec!["alice".into()]),
+                around: None,
                 watch_agent_ids: None,
             },
         )
@@ -13374,6 +13664,7 @@ done"#;
                 limit: Some(30),
                 before: None,
                 agent_ids: Some(vec!["alice".into()]),
+                around: None,
                 watch_agent_ids: None,
             },
         )
@@ -13419,6 +13710,7 @@ done"#;
                 limit: Some(30),
                 before: None,
                 agent_ids: Some(vec!["alice".into()]),
+                around: None,
                 watch_agent_ids: None,
             },
         )
@@ -13444,6 +13736,9 @@ done"#;
             &root,
             &[
                 VioletChatMessage {
+                    temporal_gap: None,
+                    model: None,
+                    effort: None,
                     id: "tool-event".into(),
                     session_id: "s".into(),
                     agent_id: "alice".into(),
@@ -13464,6 +13759,9 @@ done"#;
                     agent_status: None,
                 },
                 VioletChatMessage {
+                    temporal_gap: None,
+                    model: None,
+                    effort: None,
                     id: "message-event".into(),
                     session_id: "s".into(),
                     agent_id: "alice".into(),
@@ -13494,6 +13792,7 @@ done"#;
                 limit: Some(30),
                 before: None,
                 agent_ids: None,
+                around: None,
                 watch_agent_ids: None,
             },
         )
@@ -13512,6 +13811,9 @@ done"#;
             &root,
             &[
                 VioletChatMessage {
+                    temporal_gap: None,
+                    model: None,
+                    effort: None,
                     id: "local-command".into(),
                     session_id: "s".into(),
                     agent_id: "alice".into(),
@@ -13532,6 +13834,9 @@ done"#;
                     agent_status: None,
                 },
                 VioletChatMessage {
+                    temporal_gap: None,
+                    model: None,
+                    effort: None,
                     id: "real-user".into(),
                     session_id: "s".into(),
                     agent_id: "alice".into(),
@@ -13562,6 +13867,7 @@ done"#;
                 limit: Some(30),
                 before: None,
                 agent_ids: None,
+                around: None,
                 watch_agent_ids: None,
             },
         )
@@ -13636,6 +13942,9 @@ done"#;
         let root = temp_violet_dir("violet-cache-pages");
         fs::create_dir_all(&root).unwrap();
         let message = |timestamp: &str, text: &str| VioletChatMessage {
+            temporal_gap: None,
+            model: None,
+            effort: None,
             id: stable_message_id("s", "alice", timestamp, text),
             session_id: "s".into(),
             agent_id: "alice".into(),
@@ -13672,6 +13981,7 @@ done"#;
                 limit: Some(2),
                 before: None,
                 agent_ids: None,
+                around: None,
                 watch_agent_ids: None,
             },
         )
@@ -13692,6 +14002,7 @@ done"#;
                 limit: Some(2),
                 before: Some("2026-05-21T10:02:00Z".into()),
                 agent_ids: None,
+                around: None,
                 watch_agent_ids: None,
             },
         )
@@ -13712,6 +14023,9 @@ done"#;
         let root = temp_violet_dir("violet-filter-fallback");
         fs::create_dir_all(&root).unwrap();
         let message = |agent_id: &str, timestamp: &str, text: &str| VioletChatMessage {
+            temporal_gap: None,
+            model: None,
+            effort: None,
             id: stable_message_id("s", agent_id, timestamp, text),
             session_id: "s".into(),
             agent_id: agent_id.into(),
@@ -13754,6 +14068,7 @@ done"#;
                 limit: Some(30),
                 before: None,
                 agent_ids: Some(vec!["alice".into()]),
+                around: None,
                 watch_agent_ids: None,
             },
         )
@@ -13788,6 +14103,7 @@ done"#;
                 limit: Some(30),
                 before: None,
                 agent_ids: Some(vec!["alice".into()]),
+                around: None,
                 watch_agent_ids: None,
             },
         )
@@ -13849,6 +14165,8 @@ done"#;
     #[test]
     fn bootstrap_filter_drops_codex_setup_events() {
         let task_started = NativeEvent {
+            model: None,
+            effort: None,
             shell_handoff: None,
             handoff_bus_id: None,
             session_id: "s".into(),
@@ -13991,6 +14309,7 @@ done"#;
                 limit: Some(10),
                 before: None,
                 agent_ids: Some(vec!["agent-1234567890".into()]),
+                around: None,
                 watch_agent_ids: None,
             },
         )
@@ -14040,6 +14359,9 @@ done"#;
         write_chathistory_messages(
             &root,
             &[VioletChatMessage {
+                temporal_gap: None,
+                model: None,
+                effort: None,
                 id: "old-message".into(),
                 session_id: session_id.into(),
                 agent_id: agent_id.into(),
@@ -14080,6 +14402,7 @@ done"#;
                 limit: Some(10),
                 before: None,
                 agent_ids: Some(vec![agent_id.into()]),
+                around: None,
                 watch_agent_ids: None,
             },
         )
@@ -14145,6 +14468,9 @@ done"#;
         write_chathistory_messages(
             &root,
             &[VioletChatMessage {
+                temporal_gap: None,
+                model: None,
+                effort: None,
                 id: "old-visible-message".into(),
                 session_id: session_id.into(),
                 agent_id: agent_id.into(),
@@ -14186,6 +14512,7 @@ done"#;
                 limit: Some(10),
                 before: None,
                 agent_ids: Some(vec![agent_id.into()]),
+                around: None,
                 watch_agent_ids: None,
             },
         )
@@ -15150,3 +15477,6 @@ mod shell_switch_tests;
 
 #[cfg(test)]
 mod claude_paste_tests;
+
+#[cfg(test)]
+mod model_effort_tests;

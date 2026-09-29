@@ -1,0 +1,39 @@
+.violet-temporal-divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 24px;
+  margin: 6px 0 0;
+}
+.violet-temporal-divider::before,
+.violet-temporal-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(198, 166, 96, .3));
+}
+.violet-temporal-divider::after {
+  transform: scaleX(-1);
+}
+.violet-temporal-mark {
+  flex: 0 0 auto;
+}
+.violet-temporal-mark > .provider-badge-tooltip {
+  top: auto;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: min(420px, 80vw);
+  white-space: normal;
+  text-align: center;
+}
+.violet-temporal-mark > .provider-badge-tooltip::before {
+  top: auto;
+  bottom: -4px;
+  left: calc(50% - 4px);
+  transform: rotate(-45deg);
+}
+.violet-temporal-mark > .provider-badge-tooltip > span {
+  display: block;
+}

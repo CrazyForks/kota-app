@@ -46,6 +46,7 @@ import type { AgentId } from '../src/types/scene';
 import { createAgentGridStore } from '../src/lib/agent-grid-store';
 import type { WorkspaceTreeListing, WorkspaceTreePathRequest } from '../src/types/tree';
 import violetMessageOrderCases from './fixtures/violet-message-order.json';
+import claudeIcon from '../src/assets/tavern/icons/providers/claude.svg';
 import {
   parseRoomQuotePrompt,
   serializeRoomQuotePrompt,
@@ -635,6 +636,64 @@ describe('M1 · canvas shell landmarks', () => {
     expect(screen.getByLabelText('Open Violet summary history')).toBeInTheDocument();
     expect(screen.queryByText('Hot Memory')).not.toBeInTheDocument();
     expect(screen.queryByText(/15 records/)).not.toBeInTheDocument();
+  });
+
+  it('summarizes from the compact Violet pill and keeps the range in the title', async () => {
+    const workspace = hydrationWorkspace('violet-compact', []);
+    const summaryState: ptyClient.VioletSummaryState = {
+      latest: {
+        id: 'summary-compact',
+        updatedAt: '2026-09-26T01:20:00Z',
+        trigger: 'manual',
+        provider: 'codex',
+        summaryStartTs: '2026-09-26T01:10:00Z',
+        summaryEndTs: '2026-09-26T01:20:00Z',
+        messageCount: 12,
+        completed: ['The room summary is ready.'],
+        lastEventId: 'event-summary-end',
+        logPath: 'project-memory/chathistory/summaries/recent.json',
+      },
+      history: [],
+      outstanding: { messageCount: 3 },
+      logPath: 'project-memory/chathistory/summaries/recent.json',
+      promptPath: '$KOTA_HOME/heroes/system-violet/violet-summary.md',
+      updatedAt: '2026-09-26T01:20:00Z',
+    };
+    vi.spyOn(ptyClient, 'readVioletSummary').mockResolvedValue(summaryState);
+    let finishSummary!: (value: ptyClient.VioletSummaryState) => void;
+    const summarize = vi.spyOn(ptyClient, 'summarizeVioletNow').mockReturnValue(
+      new Promise((resolve) => { finishSummary = resolve; }),
+    );
+    const { container } = render(
+      <RightColumn
+        sceneKey="conversation"
+        onOpenHotMem={vi.fn()}
+        workspace={workspace}
+        projectRoot={workspace.localRoot}
+      />,
+    );
+    const pill = await screen.findByRole('button', { name: '3 turns outstanding · Summary Now' });
+    expect(pill).toHaveClass('violet-summary-pill');
+    expect(within(pill).getByText('3')).toBeInTheDocument();
+    expect(within(pill).getByRole('tooltip')).toHaveTextContent('3 turns outstanding · Summary Now');
+    expect(container.querySelector('.violet-summary-title')?.getAttribute('title'))
+      .toMatch(/^.+ - .+ · 12 turns summarized$/);
+    expect(container.querySelector('.violet-summary-range')).not.toBeInTheDocument();
+
+    fireEvent.keyDown(pill, { key: 'Enter' });
+    await userEvent.click(pill);
+    expect(summarize).toHaveBeenCalledTimes(1);
+    expect(summarize).toHaveBeenCalledWith(expect.objectContaining({
+      projectRoot: workspace.localRoot,
+      autoRun: false,
+    }));
+    expect(screen.queryByRole('dialog', { name: 'Violet summary history' })).not.toBeInTheDocument();
+    expect(pill).toBeDisabled();
+    expect(within(pill).getByRole('tooltip').textContent)
+      .toMatch(/^3 turns outstanding · summary running · Timeout in \d+ s$/);
+
+    await act(async () => finishSummary({ ...summaryState, outstanding: { messageCount: 0 } }));
+    expect(container.querySelector('.violet-summary-pill')).not.toBeInTheDocument();
   });
 
   it('keeps the human Ember target available without Laughing Man', async () => {
@@ -1772,6 +1831,25 @@ describe('W3+W5 · composer target picker', () => {
     expect(screen.getByTestId('group-chat-overlay')).toBeInTheDocument();
     fireEvent.keyDown(window, { key: '9', ctrlKey: true });
     expect(screen.queryByTestId('group-chat-overlay')).not.toBeInTheDocument();
+  });
+
+  it('keeps the project search modal through Cmd+9 background toggles and resets only on full close', async () => {
+    render(<App />);
+    fireEvent.keyDown(window, { key: '9', metaKey: true });
+    await userEvent.click(screen.getByLabelText('Search room history'));
+    const search = screen.getByRole('searchbox');
+    fireEvent.change(search, { target: { value: 'preserved search' } });
+    fireEvent.keyDown(search, { key: '9', metaKey: true });
+    expect(screen.queryByTestId('group-chat-overlay')).not.toBeInTheDocument();
+    expect(screen.getByRole('searchbox')).toHaveValue('preserved search');
+    fireEvent.keyDown(search, { key: '9', metaKey: true });
+    expect(screen.getByTestId('group-chat-overlay')).toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: 'Search room history' })).toBeInTheDocument();
+    expect(document.querySelector<HTMLElement>('.workspace')?.inert).toBe(true);
+    await userEvent.click(screen.getByLabelText('Close search'));
+    expect(document.querySelector<HTMLElement>('.workspace')?.inert).toBe(false);
+    await userEvent.click(screen.getByLabelText('Search room history'));
+    expect(screen.getByRole('searchbox')).toHaveValue('');
   });
 
   it('Ctrl+0 minimizes terminals without closing the group chat overlay', async () => {
@@ -6174,6 +6252,42 @@ describe('Project agent hydration recovery', () => {
       restoreStorage: storage.restore,
     };
   }
+
+  it('passes the detail provider or CLI fallback through to seat badges without changing seat titles', async () => {
+    const workspace = hydrationWorkspace('fable-provider-seats', ['agent-alpha', 'agent-beta']);
+    const { restoreStorage } = mockWorkspaceBootstrap(workspace);
+    vi.spyOn(ptyClient, 'inspectProjectAgentIdentities').mockResolvedValue({
+      identities: [hydrationIdentity('agent-alpha', 'Alpha'), hydrationIdentity('agent-beta', 'Beta')],
+      workspaceEntryCount: 2,
+    });
+    vi.spyOn(ptyClient, 'loadProjectAgentDetail').mockImplementation(async ({ agentId }) => ({
+      ...hydrationDetail(agentId, workspace.localRoot, agentId === 'agent-alpha' ? 'Alpha' : 'Beta'),
+      provider: agentId === 'agent-alpha' ? 'claude' : '',
+      cli: 'codex',
+    }));
+    const view = render(<App />);
+    try {
+      await waitFor(() => expect(view.container.querySelector('.stage')).not.toHaveAttribute('aria-busy'));
+      const seat = await waitFor(() => {
+        const card = view.container.querySelector('.seat[title="Alpha"]');
+        expect(card).toBeInTheDocument();
+        return card as HTMLElement;
+      });
+      const badge = within(seat).getByLabelText('Claude Code');
+      expect(badge.previousElementSibling).toHaveClass('seat-name');
+      expect(badge.querySelector('img')).toHaveAttribute('src', claudeIcon);
+      expect(badge.querySelector('img')).toHaveAttribute('width', '16');
+      const tooltip = within(badge).getByRole('tooltip', { hidden: true });
+      expect(tooltip).toHaveTextContent('Claude Code');
+      expect(badge).toHaveAttribute('aria-describedby', tooltip.id);
+      expect(seat).toHaveAttribute('title', 'Alpha');
+      const fallbackSeat = view.container.querySelector('.seat[title="Beta"]') as HTMLElement;
+      expect(within(fallbackSeat).getByLabelText('Codex')).toBeInTheDocument();
+    } finally {
+      view.unmount();
+      restoreStorage();
+    }
+  });
 
   it('keeps provisional seats, retries suspicious empty results, and never persists them', async () => {
     vi.useFakeTimers();

@@ -2428,7 +2428,7 @@ dependencies = [
 
 [[package]]
 name = "kota-v2"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -2440,6 +2440,7 @@ dependencies = [
  "dispatch2",
  "flate2",
  "libc",
+ "memchr",
  "notify",
  "objc2",
  "objc2-app-kit",

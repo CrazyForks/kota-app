@@ -1,0 +1,53 @@
+{
+  "claude": [
+    {"type":"user","uuid":"fable-user","timestamp":"2026-01-01T00:00:00Z","effort":"ignored","message":{"model":"ignored","content":"A request."}},
+    {"type":"assistant","uuid":"fable-progress","timestamp":"2026-01-01T00:00:01Z","effort":"max","message":{"model":"claude-fable-5-1","stop_reason":"tool_use","content":[{"type":"text","text":"Checking."}]}},
+    {"type":"assistant","uuid":"fable-final","timestamp":"2026-01-01T00:00:02Z","effort":"max","message":{"model":"claude-fable-5-1","stop_reason":"end_turn","content":[{"type":"text","text":"First answer."}]}},
+    {"type":"assistant","uuid":"fable-synthetic","timestamp":"2026-01-01T00:00:03Z","message":{"model":"<synthetic>","content":[{"type":"text","text":"Synthetic answer."}]}},
+    {"type":"assistant","uuid":"fable-model-only","timestamp":"2026-01-01T00:00:04Z","message":{"model":"claude-fable-5-2","stop_reason":"end_turn","content":[{"type":"text","text":"Model only."}]}}
+  ],
+  "codex": [
+    {"type":"turn_context","timestamp":"2026-01-01T00:00:00Z","payload":{"model":"gpt-fable-6","effort":"xhigh"}},
+    {"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Checking."}]}},
+    {"type":"event_msg","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"user_message","message":"A request."}},
+    {"type":"response_item","timestamp":"2026-01-01T00:00:03Z","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"First answer."}]}},
+    {"type":"turn_context","timestamp":"2026-01-01T00:00:04Z","payload":{"model":"gpt-fable-7"}},
+    {"type":"event_msg","timestamp":"2026-01-01T00:00:05Z","payload":{"type":"agent_message","message":"Model only."}}
+  ],
+  "kimi": [
+    {"type":"llm.request","time":1767225600000,"model":"kimi-fable-3","thinkingEffort":"high"},
+    {"type":"turn.prompt","time":1767225601000,"input":"A request."},
+    {"type":"context.append_loop_event","time":1767225602000,"event":{"type":"content.part","uuid":"fable-think","part":{"type":"think","think":"Checking."}}},
+    {"type":"context.append_loop_event","time":1767225603000,"event":{"type":"content.part","uuid":"fable-first","part":{"type":"text","text":"First answer."}}},
+    {"type":"llm.request","time":1767225604000,"model":"kimi-fable-3","thinkingEffort":"max"},
+    {"type":"context.append_loop_event","time":1767225605000,"event":{"type":"content.part","uuid":"fable-max","part":{"type":"text","text":"Max answer."}}},
+    {"type":"llm.request","time":1767225606000,"model":"kimi-fable-4","thinkingEffort":"on"},
+    {"type":"context.append_loop_event","time":1767225607000,"event":{"type":"content.part","uuid":"fable-on","part":{"type":"text","text":"On answer."}}},
+    {"type":"llm.request","time":1767225608000,"model":"kimi-fable-4"},
+    {"type":"context.append_loop_event","time":1767225609000,"event":{"type":"content.part","uuid":"fable-model-only","part":{"type":"text","text":"Model only."}}}
+  ],
+  "pi": [
+    {"type":"thinking_level_change","id":"fable-level","parentId":null,"timestamp":"2026-01-01T00:00:00Z","thinkingLevel":"xhigh"},
+    {"type":"message","id":"fable-user","parentId":"fable-level","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"A request."}},
+    {"type":"message","id":"fable-progress","parentId":"fable-user","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","model":"pi-fable-1","stopReason":"toolUse","content":[{"type":"text","text":"Checking."}]}},
+    {"type":"message","id":"fable-first","parentId":"fable-progress","timestamp":"2026-01-01T00:00:03Z","message":{"role":"assistant","model":"pi-fable-1","stopReason":"stop","content":[{"type":"text","text":"First answer."}]}},
+    {"type":"thinking_level_change","id":"fable-old-level","parentId":"fable-first","timestamp":"2026-01-01T00:00:04Z","thinkingLevel":"max"},
+    {"type":"message","id":"fable-old","parentId":"fable-old-level","timestamp":"2026-01-01T00:00:05Z","message":{"role":"assistant","model":"pi-fable-old","content":[{"type":"text","text":"Abandoned branch."}]}},
+    {"type":"thinking_level_change","id":"fable-new-level","parentId":"fable-first","timestamp":"2026-01-01T00:00:06Z","thinkingLevel":"off"},
+    {"type":"message","id":"fable-new","parentId":"fable-new-level","timestamp":"2026-01-01T00:00:07Z","message":{"role":"assistant","model":"pi-fable-2","stopReason":"stop","content":[{"type":"text","text":"New branch."}]}}
+  ],
+  "opencode": [
+    {"id":"fable-open-final","role":"assistant","modelID":"gpt-fable-open","effort":"must-not-be-used","time":{"created":1767225600000,"completed":1767225601000},"finish":"stop"}
+  ],
+  "antigravity": [
+    {"type":"USER_INPUT","source":"USER_EXPLICIT","step_index":0,"status":"DONE","created_at":"2026-01-01T00:00:00Z","content":"<USER_SETTINGS_CHANGE> The user changed setting `Model Selection` from Fable Old to Gemini 3.8 Flash (High). </USER_SETTINGS_CHANGE><USER_REQUEST>A request.</USER_REQUEST>"},
+    {"type":"PLANNER_RESPONSE","source":"MODEL","step_index":1,"status":"DONE","created_at":"2026-01-01T00:00:01Z","tool_calls":[{"name":"inspect"}],"content":"Checking."},
+    {"type":"PLANNER_RESPONSE","source":"MODEL","step_index":2,"status":"DONE","created_at":"2026-01-01T00:00:02Z","content":"First answer."},
+    {"type":"USER_INPUT","source":"USER_EXPLICIT","step_index":3,"status":"DONE","created_at":"2026-01-01T00:00:03Z","content":"<USER_REQUEST>Another request.</USER_REQUEST>"},
+    {"type":"PLANNER_RESPONSE","source":"MODEL","step_index":4,"status":"DONE","created_at":"2026-01-01T00:00:04Z","content":"Same setting."},
+    {"type":"USER_INPUT","source":"USER_EXPLICIT","step_index":5,"status":"DONE","created_at":"2026-01-01T00:00:05Z","content":"<USER_SETTINGS_CHANGE>The user changed setting `Model Selection` from Gemini 3.8 Flash (High) to Fable Model.</USER_SETTINGS_CHANGE><USER_REQUEST>Continue.</USER_REQUEST>"},
+    {"type":"PLANNER_RESPONSE","source":"MODEL","step_index":6,"status":"DONE","created_at":"2026-01-01T00:00:06Z","content":"Model only."},
+    {"type":"USER_INPUT","source":"USER_EXPLICIT","step_index":7,"status":"DONE","created_at":"2026-01-01T00:00:07Z","content":"<USER_SETTINGS_CHANGE>Model Selection now uses an unknown format.</USER_SETTINGS_CHANGE><USER_REQUEST>Continue.</USER_REQUEST>"},
+    {"type":"PLANNER_RESPONSE","source":"MODEL","step_index":8,"status":"DONE","created_at":"2026-01-01T00:00:08Z","content":"Unknown setting."}
+  ]
+}

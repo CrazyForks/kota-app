@@ -12,6 +12,7 @@ import {
   violetRevealFileRef,
   violetResolveFileRef,
   type AgentBusReceipt,
+  type AccountUserIdentity,
   type VioletChatMessage,
   type VioletFileRefResolveResult,
   type VioletRoomState,
@@ -30,6 +31,9 @@ import {
   type VioletComposerSentDetail,
 } from './violet-room-events';
 import { ProjectAgentName } from './ProjectAgentName';
+import { ProviderBadge } from './ProviderBadge';
+import { VioletTemporalDivider } from './VioletTemporalDivider';
+import { providerIconForId } from '../lib/provider-icons';
 import { avatarClassForId, avatarImageStyleForId } from '../lib/hero-avatars';
 import { AgentCommendButton } from './AgentCommendButton';
 import { isHumanTelegramTarget } from '../ember-config';
@@ -39,6 +43,8 @@ import {
   prepareComposerDeliveryDedupeText,
   prepareDedupeText,
   preparedDedupeTextsMatch,
+  splitLeadingEnvelopePrefix,
+  stripLeadingTemporalGapForDisplay,
   timestampsWithinComposerConfirmationWindow,
   type PreparedDedupeText,
 } from '../lib/violet-message-dedupe';
@@ -53,6 +59,8 @@ import {
 import { RoomQuoteMark } from '../lib/room-quote-mark';
 import subagentUpdateIconUrl from '../assets/tavern/icons/subagent-update.png';
 import { filterAgentBusMessages } from '../lib/violet-message-filter';
+import { HeroAvatarArt } from './HeroAvatarPicker';
+import { SearchMatchText, RoomSearchIcon, roomSearchDateLabel, VIOLET_DATE_MONTHS } from './room-search-elements';
 
 export {
   normalizeAttachmentInsensitive,
@@ -77,6 +85,7 @@ interface VioletRoomPanelProps {
   onRetryComposerMessage?: (request: VioletComposerRetryRequest) => boolean | void | Promise<boolean | void>;
   onQuoteMessage?: (quote: RoomQuoteReference) => RoomQuoteInsertResult;
   onClose?: () => void;
+  onSearch?: () => void;
 }
 
 export interface VioletComposerRetryRequest {
@@ -128,6 +137,7 @@ type PreparedLocalComposerMessage = PreparedNativeUserMessage & {
 type MatchedNativeComposerMessage = {
   quoteRefId: string;
   violetSeq?: number | null;
+  temporalGap?: VioletChatMessage['temporalGap'];
 };
 
 type PreparedVioletMessageSort<T extends VioletChatMessage> = {
@@ -216,6 +226,7 @@ export function VioletRoomPanel({
   onRetryComposerMessage,
   onQuoteMessage,
   onClose,
+  onSearch,
 }: VioletRoomPanelProps) {
   const agentIdsKey = agentIds.join('|');
   const roomCacheKey = `${projectRoot ?? ''}::all`;
@@ -476,6 +487,8 @@ export function VioletRoomPanel({
       targetAgentIds,
       privacy: detail.privacy,
       composerMentions: detail.mentions,
+      temporalGap: detail.temporalGap,
+      quoteRefId: detail.temporalGap ? detail.id : undefined,
     };
     if (!detail.delivery) return message;
     if (detail.delivery.status === 'clear') return completeMessageDelivery(message);
@@ -502,6 +515,7 @@ export function VioletRoomPanel({
           existing &&
           existing.text === message.text &&
           existing.timestamp === message.timestamp &&
+          JSON.stringify(existing.temporalGap) === JSON.stringify(message.temporalGap) &&
           existing.targetAgentIds?.join('|') === message.targetAgentIds?.join('|')
         ) {
           return prev;
@@ -1130,6 +1144,17 @@ export function VioletRoomPanel({
       data-chat-filter-agents={chatFilterActive ? chatFilterAgentIds.join('|') : undefined}
       data-show-agent-to-agent-messages={showAgentToAgentMessages}
     >
+      {onSearch && (
+        <button
+          type="button"
+          className="violet-room-minimize violet-room-search-open"
+          onClick={onSearch}
+          aria-label="Search room history"
+          title="Search room history (⌘F)"
+        >
+          <RoomSearchIcon />
+        </button>
+      )}
       {onClose && (
         <button
           type="button"
@@ -1226,7 +1251,7 @@ export function VioletRoomPanel({
   );
 }
 
-const VioletMessageBubble = memo(function VioletMessageBubble({
+export const VioletMessageBubble = memo(function VioletMessageBubble({
   message,
   projectRoot,
   agent,
@@ -1239,6 +1264,7 @@ const VioletMessageBubble = memo(function VioletMessageBubble({
   onRetryComposerMessage,
   onRetryAgentBusMessage,
   onQuoteMessage,
+  searchResult,
 }: {
   message: VioletRoomMessage;
   projectRoot?: string | null;
@@ -1256,6 +1282,13 @@ const VioletMessageBubble = memo(function VioletMessageBubble({
   onRetryComposerMessage?: (message: VioletRoomMessage) => void;
   onRetryAgentBusMessage?: (message: VioletRoomMessage) => void;
   onQuoteMessage?: (quote: RoomQuoteReference) => void;
+  searchResult?: {
+    human: AccountUserIdentity;
+    now: Date;
+    terms: readonly string[];
+    selected: boolean;
+    onOpen: () => void;
+  };
 }) {
   if (message.kind === 'compaction') {
     return (
@@ -1287,6 +1320,8 @@ const VioletMessageBubble = memo(function VioletMessageBubble({
   const isBartenderConflict = isBartenderConflictMessage(message);
   const isEmberDream = isEmberDreamMessage(message);
   const showAvatar = !isUser && (!isProcess || isCommentary);
+  // End-turn only: keep the multi-agent Progress avatar stack and layout unchanged.
+  const showProviderBadge = !isUser && message.kind === 'message' && !!providerIconForId(message.shell);
   const progressEntries = isCommentary ? progressEntriesForMessage(message) : [];
   const progressItems = progressEntries.map((entry) => entry.text);
   const latestProgressEntry = progressEntries[progressEntries.length - 1];
@@ -1305,7 +1340,7 @@ const VioletMessageBubble = memo(function VioletMessageBubble({
   const actorName = systemActorName(message.agentId);
   const actorDescription = systemActorDescription(message.agentId);
   const label = isUser
-    ? 'You'
+    ? searchResult?.human.name || 'You'
     : isMultiAgentProgress
       ? `${progressAgentIds.length} agents`
       : messageAgent?.name ?? actorName ?? message.agentId;
@@ -1341,7 +1376,12 @@ const VioletMessageBubble = memo(function VioletMessageBubble({
     (message.deliveryStatus === 'failed' || message.deliveryStatus === 'unconfirmed')
   );
   const showRetry = showComposerRetry || (AGENT_BUS_RETRY_UI_ENABLED && showAgentBusRetry);
-  const parsedQuotePrompt = parseRoomQuotePrompt(message.text);
+  const displayText = message.role === 'user'
+    ? stripLeadingTemporalGapForDisplay(message.text)
+    : message.text;
+  const { prefix, rest } = splitLeadingEnvelopePrefix(displayText);
+  const parsedQuote = parseRoomQuotePrompt(rest);
+  const parsedQuotePrompt = { quotes: parsedQuote.quotes, body: prefix + parsedQuote.body };
   const canQuote = (
     !!onQuoteMessage &&
     !!(message.local ? message.quoteRefId : message.id) &&
@@ -1349,7 +1389,55 @@ const VioletMessageBubble = memo(function VioletMessageBubble({
     message.text.length > 0 &&
     isQuoteableRoomMessage(message)
   );
-  return (
+  if (searchResult) {
+    // Reuse the room's identity, target and provider mapping; only the layout changes.
+    const excerpt = [...parsedQuotePrompt.quotes.map((quote) => quote.excerpt), parsedQuotePrompt.body].join('\n');
+    const date = new Date(message.timestamp);
+    const validDate = !Number.isNaN(date.getTime());
+    const clock = validDate ? VIOLET_TIME_FORMATTER.format(date) : '';
+    return (
+      <button
+        type="button"
+        className={`room-search-result${searchResult.selected ? ' selected' : ''}`}
+        data-search-message-id={message.id}
+        aria-current={searchResult.selected ? 'true' : undefined}
+        onClick={searchResult.onOpen}
+      >
+        <time className={`room-search-when${validDate ? '' : ' invalid'}`} dateTime={message.timestamp}
+          title={validDate ? `${formatLocalDateLabel(date)} ${clock}` : message.timestamp}>
+          <span className="room-search-day">{roomSearchDateLabel(message.timestamp, searchResult.now)}</span>
+          {clock && <span className="room-search-clock">{clock}</span>}
+        </time>
+        {isUser ? (
+          <HeroAvatarArt className="room-search-avatar" avatarId={searchResult.human.avatarId} />
+        ) : (
+          <span className={`room-search-avatar tavern-avatar-art ${messageAgent?.avatarClass ?? providerAvatarClass(message.agentId)}`} style={avatarImageStyleForId(messageAgent?.avatarId)} aria-hidden>
+            <span /><i /><b />
+          </span>
+        )}
+        <span className="room-search-result-copy">
+          <span className="room-search-result-heading">
+            <ProjectAgentName name={label} compact className={lifecycle ? 'inactive' : ''} />
+            {lifecycleLabel && <em className="violet-agent-status-label">{lifecycleLabel}</em>}
+            {targetBadges.map((id) => (
+              <em key={id} className={`violet-target-badge ${isHumanTelegramTarget(id) ? 'human' : ''}`}>
+                @{targetBadgeLabel(id, agentMeta, humanTargetName)}
+              </em>
+            ))}
+          </span>
+          <span className="room-search-excerpt"><SearchMatchText text={excerpt} terms={searchResult.terms} /></span>
+          {showProviderBadge && (
+            <span className="violet-msg-model">
+              <ProviderBadge provider={message.shell} size={10} />
+              {message.model && <span className="violet-msg-model-text">{message.model}{message.effort && ` • ${message.effort}`}</span>}
+            </span>
+          )}
+        </span>
+        <span className="room-search-result-arrow" aria-hidden>›</span>
+      </button>
+    );
+  }
+  const bubble = (
     <article
       className={[
         'violet-msg',
@@ -1544,8 +1632,27 @@ const VioletMessageBubble = memo(function VioletMessageBubble({
             </button>
           )}
         </div>
+        {showProviderBadge && (
+          <div className="violet-msg-model">
+            <ProviderBadge provider={message.shell} size={10} />
+            {message.model && (
+              <span className="violet-msg-model-text">
+                {message.model}
+                {message.effort && <span className="violet-msg-effort"> • {message.effort}</span>}
+              </span>
+            )}
+          </div>
+        )}
       </div>
     </article>
+  );
+  return (
+    <>
+      {isUser && message.agentId === 'user' && message.temporalGap && (
+        <VioletTemporalDivider gap={message.temporalGap} agentMeta={agentMeta} />
+      )}
+      {bubble}
+    </>
   );
 });
 
@@ -1592,7 +1699,11 @@ function roomQuoteReferenceForMessage(
 ): RoomQuoteReference | null {
   const ref = message.local ? message.quoteRefId : message.id;
   const project = roomQuoteProjectKey(projectRoot);
-  const sourceText = parseRoomQuotePrompt(message.text).body;
+  const displayText = message.role === 'user'
+    ? stripLeadingTemporalGapForDisplay(message.text)
+    : message.text;
+  const { prefix, rest } = splitLeadingEnvelopePrefix(displayText);
+  const sourceText = prefix + parseRoomQuotePrompt(rest).body;
   const excerpt = truncateRoomQuoteExcerpt(sourceText);
   if (!ref || !project || !excerpt.excerpt || !isQuoteableRoomMessage(message)) return null;
 
@@ -3307,12 +3418,17 @@ export function mergeRoomMessages(
   const preparedLocalMessages = prepareLocalComposerMessages(localMessages);
   const nativeMatchByLocalId = new Map<string, MatchedNativeComposerMessage>();
   const filteredNative = nativeMessages.filter((message) => {
+    // Composer cross-day sends have their own persisted clean user message.
+    // Keep native evidence in state for existing delivery confirmation, but
+    // never turn this transport copy into another visible bubble.
+    if (isNativeTemporalGapEcho(message)) return false;
     const local = matchingLocalComposerMessage(message, preparedLocalMessages);
     if (!local) return true;
-    if (!nativeMatchByLocalId.has(local.id)) {
+    if (!nativeMatchByLocalId.has(local.id) || (message.agentId === 'user' && message.temporalGap)) {
       nativeMatchByLocalId.set(local.id, {
         quoteRefId: message.id,
         violetSeq: message.violetSeq,
+        temporalGap: message.temporalGap,
       });
     }
     return false;
@@ -3320,10 +3436,13 @@ export function mergeRoomMessages(
   const materializedLocalMessages = localMessages.map((message) => {
     const nativeMatch = nativeMatchByLocalId.get(message.id);
     if (!nativeMatch) return message;
+    const quoteRefId = message.temporalGap ? message.id : nativeMatch.quoteRefId;
     const violetSeq = nativeMatch.violetSeq ?? message.violetSeq;
-    return message.quoteRefId === nativeMatch.quoteRefId && message.violetSeq === violetSeq
+    const temporalGap = nativeMatch.temporalGap ?? message.temporalGap;
+    return message.quoteRefId === quoteRefId && message.violetSeq === violetSeq &&
+      JSON.stringify(message.temporalGap) === JSON.stringify(temporalGap)
       ? message
-      : { ...message, quoteRefId: nativeMatch.quoteRefId, violetSeq };
+      : { ...message, quoteRefId, violetSeq, temporalGap };
   });
   const markedNative = markGhostSasayakiMessages(
     collapseNativeBroadcastUserMessages(filteredNative),
@@ -3348,7 +3467,7 @@ function normalizeAgentIds(ids: readonly AgentId[]): AgentId[] {
   return Array.from(new Set(ids.filter((id): id is AgentId => Boolean(id)))).sort();
 }
 
-function collapseNativeBroadcastUserMessages(messages: readonly VioletChatMessage[]): VioletRoomMessage[] {
+export function collapseNativeBroadcastUserMessages(messages: readonly VioletChatMessage[]): VioletRoomMessage[] {
   const sorted = sortVioletMessages(messages);
   const groups: Array<{
     textKey: string;
@@ -3411,7 +3530,7 @@ function markGhostSasayakiMessages(
     .sort((a, b) => a.time - b.time || a.message.id.localeCompare(b.message.id));
 
   const markedInternalEchoes = nativeMessages.map((message) => (
-    message.messageOrigin === 'shell_handoff' || isNativeInternalAgentBusEnvelopeEcho(message) || isNativeTemporalGapEcho(message)
+    message.messageOrigin === 'shell_handoff' || isNativeInternalAgentBusEnvelopeEcho(message)
       ? { ...message, ghostSasayaki: true }
       : message
   ));
@@ -3947,7 +4066,7 @@ function dedupeRoomMessages(messages: VioletRoomMessage[]): VioletRoomMessage[] 
   const out: VioletRoomMessage[] = [];
   for (const message of sorted) {
     const bucket = Math.floor(Date.parse(message.timestamp) / 120000) || 0;
-    const key = [
+    const key = message.temporalGap && message.agentId === 'user' ? `composer:${message.id}` : [
       message.agentId,
       message.role,
       message.kind,
@@ -4125,10 +4244,13 @@ function sameRoomMessage(left: VioletChatMessage, right: VioletChatMessage): boo
     nullishString(left.sourcePath) === nullishString(right.sourcePath) &&
     nullishString(left.nativeEventId) === nullishString(right.nativeEventId) &&
     nullishString(left.actorIntent) === nullishString(right.actorIntent) &&
+    JSON.stringify(left.temporalGap ?? null) === JSON.stringify(right.temporalGap ?? null) &&
     nullishString(left.messageOrigin) === nullishString(right.messageOrigin) &&
     nullishString(left.agentDisplayName) === nullishString(right.agentDisplayName) &&
     nullishString(left.agentAvatarId) === nullishString(right.agentAvatarId) &&
     nullishString(left.agentProvider) === nullishString(right.agentProvider) &&
+    nullishString(left.model) === nullishString(right.model) &&
+    nullishString(left.effort) === nullishString(right.effort) &&
     nullishString(left.agentStatus) === nullishString(right.agentStatus) &&
     targetAgentIdsKey(left.targetAgentIds) === targetAgentIdsKey(right.targetAgentIds) &&
     Boolean(leftRoom.local) === Boolean(rightRoom.local) &&
@@ -4209,6 +4331,9 @@ function matchingLocalComposerMessage(
   localMessages: readonly PreparedLocalComposerMessage[],
 ): PreparedLocalComposerMessage | undefined {
   if (nativeMessage.role !== 'user') return undefined;
+  if (nativeMessage.agentId === 'user' && nativeMessage.temporalGap) {
+    return localMessages.find((local) => local.id === nativeMessage.id);
+  }
   const nativeText = prepareDedupeText(nativeMessage.text);
   if (!nativeText.normalized) return undefined;
   const nativeTime = Date.parse(nativeMessage.timestamp);
@@ -4341,8 +4466,6 @@ function systemActorDescription(id: string): string | null {
   if (id === 'violet') return 'I am Violet. I keep the room history organized.';
   return null;
 }
-
-const VIOLET_DATE_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 function formatTime(value: string): string {
   const date = new Date(value);

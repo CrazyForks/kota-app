@@ -25,6 +25,20 @@ export function stripLeadingTemporalGap(text: string): string {
   return match ? prepared.slice(match[0].length) : text;
 }
 
+export function stripLeadingTemporalGapForDisplay(text: string): string {
+  const prepared = prepareLeadingEnvelopeText(text);
+  const match = prepared.match(TEMPORAL_GAP_BLOCK);
+  if (!match) return text;
+  // Keep provider attachment markers available to the display/image path.
+  const prefix = text.slice(0, text.length - prepared.length);
+  return prefix + prepared.slice(match[0].length);
+}
+
+export function splitLeadingEnvelopePrefix(text: string): { prefix: string; rest: string } {
+  const rest = prepareLeadingEnvelopeText(text);
+  return { prefix: text.slice(0, text.length - rest.length), rest };
+}
+
 export function preparedDedupeTextsMatch(
   nativeText: PreparedDedupeText,
   localText: PreparedDedupeText,

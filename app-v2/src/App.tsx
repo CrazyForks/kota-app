@@ -119,7 +119,7 @@ import {
   type ProjectAgentNameFields,
 } from './chrome/ProjectAgentName';
 import { avatarClassForId, refreshUserHeroAvatars } from './lib/hero-avatars';
-import { emitVioletComposerSent } from './chrome/violet-room-events';
+import { emitVioletComposerSent, recordVioletComposerTemporalGap } from './chrome/violet-room-events';
 import { reconcileVioletComposerAfterAgentExit } from './chrome/violet-composer-exit';
 import { formatAgentPromptInput, normalizeAgentPromptPayload } from './lib/agent-prompt';
 import { mintProjectAgentId } from './lib/project-agent-ids';
@@ -1214,6 +1214,7 @@ export function App() {
       next[identity.agentId] = {
         ...base,
         name: identity.displayName,
+        provider: identity.provider,
         role: unsupportedProvider
           ? `Unsupported provider: ${unsupportedProvider}`
           : base.role,
@@ -1235,6 +1236,7 @@ export function App() {
       next[instance.id] = {
         ...base,
         name: instance.name,
+        provider: next[instance.id]?.provider || instance.cli,
         captain: false,
         avatarId: instance.avatarId,
         avatarClass: instance.avatarClass ?? avatarClassForId(instance.avatarId, instance.cli),
@@ -4179,7 +4181,7 @@ export function App() {
         }
         return false;
       }
-      emitVioletComposerSent({
+      const sent = emitVioletComposerSent({
         projectRoot: violetProjectRoot,
         text: normalizedPayload,
         targetAgentIds: recipients,
@@ -4188,11 +4190,18 @@ export function App() {
       });
       let preparedPayloads = new Map<AgentId, string>();
       try {
-        preparedPayloads = new Map((await prepareComposerTemporalContext({
-          projectRoot: violetProjectRoot,
-          targetAgentIds: recipients,
-          payload,
-        })).map((prepared) => [prepared.targetAgentId, prepared.payload]));
+        if (sent && !sent.privacy) {
+          const prepared = await prepareComposerTemporalContext({
+            projectRoot: violetProjectRoot,
+            messageId: sent.id,
+            timestamp: sent.timestamp,
+            targetAgentIds: recipients,
+            payload: normalizedPayload,
+          });
+          preparedPayloads = new Map(prepared.map((item) => [item.targetAgentId, item.payload]));
+          const temporalGap = prepared.find((item) => item.temporalGap)?.temporalGap;
+          if (temporalGap) recordVioletComposerTemporalGap(sent.id, temporalGap);
+        }
       } catch (err) {
         console.warn('[composer] temporal context unavailable', err);
       }
@@ -4339,6 +4348,7 @@ export function App() {
                     agentMeta={agentMeta}
                     unsupportedAgentProviders={unsupportedAgentProviders}
                     projectName={activeProjectName}
+                    projectId={activeWorkspace?.projectId}
                     targetAgent={targetAgent}
                     chatFilterTargetAgents={chatFilterTargetAgents}
                     chatFilterActive={chatFilterActive}

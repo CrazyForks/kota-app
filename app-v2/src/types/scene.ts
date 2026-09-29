@@ -13,6 +13,7 @@ export interface Agent {
   captain?: boolean;
   avatarId?: string | null;
   avatarClass?: string;
+  provider?: string | null;
   lifecycleStatus?: 'archived' | 'left' | string;
   /** Raw provider name when this Kota build cannot launch the agent. */
   unsupportedProvider?: string;

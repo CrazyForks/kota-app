@@ -350,6 +350,112 @@ function formatLmQueueTime(value: string | null | undefined): string {
   return (sameDay ? CLOCK_TIME_FORMATTER : MONTH_DAY_TIME_FORMATTER).format(date);
 }
 
+type VioletSummaryFaultState = { text: string; open: boolean; resolved: boolean };
+
+function violetSummaryFaultPreview(text: string): string {
+  const line = text.split('\n').find((part) => part.trim())?.trim() ?? '';
+  return line.replace(/^\S+ summary CLI /, '');
+}
+
+/** Folded CLI error line under the Violet summary. The error text stays behind
+ *  a one-line header until the user opens it, and can then be selected and
+ *  copied. An error that clears while the line is folded unmounts it; one
+ *  that clears while open turns the header into a resolved state the user
+ *  closes by hand, so text they are reading is never pulled away. */
+export function VioletSummaryFault({ error, provider }: { error: string | null; provider: string }) {
+  const [fault, setFault] = useState<VioletSummaryFaultState | null>(null);
+  const [copied, setCopied] = useState(false);
+  const copiedTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    setFault((prev) => {
+      if (error !== null) {
+        if (prev && prev.text === error && !prev.resolved) return prev;
+        // First error, a changed error, or a new error over a resolved line.
+        return { text: error, open: false, resolved: false };
+      }
+      if (!prev) return null;
+      if (!prev.open) return null;
+      return prev.resolved ? prev : { ...prev, resolved: true };
+    });
+  }, [error]);
+
+  useEffect(() => () => {
+    if (copiedTimerRef.current !== null) window.clearTimeout(copiedTimerRef.current);
+  }, []);
+
+  if (!fault) return null;
+
+  const toggle = () => {
+    setFault((prev) => {
+      if (!prev) return null;
+      if (prev.resolved) return null;
+      return { ...prev, open: !prev.open };
+    });
+  };
+  const copy = async () => {
+    try {
+      await navigator.clipboard?.writeText(fault.text);
+      setCopied(true);
+      if (copiedTimerRef.current !== null) window.clearTimeout(copiedTimerRef.current);
+      copiedTimerRef.current = window.setTimeout(() => setCopied(false), 1200);
+    } catch (err) {
+      console.error('[violet-summary] copy failed', err);
+    }
+  };
+  const label = `${fault.resolved ? 'Resolved' : 'CLI error'} · ${provider}`;
+
+  return (
+    <div
+      className={`violet-summary-fault ${fault.open ? 'open' : ''} ${fault.resolved ? 'resolved' : ''}`}
+      onClick={(event) => event.stopPropagation()}
+      onKeyDown={(event) => event.stopPropagation()}
+    >
+      <div
+        className="violet-summary-fault-line"
+        role="button"
+        tabIndex={0}
+        aria-expanded={fault.open}
+        aria-label={fault.open ? `Hide ${label}` : `Show ${label}`}
+        onClick={toggle}
+        onKeyDown={(event) => {
+          // Keys on the Copy button inside the line must reach it, not toggle.
+          if (event.target !== event.currentTarget) return;
+          if (event.key !== 'Enter' && event.key !== ' ') return;
+          event.preventDefault();
+          toggle();
+        }}
+      >
+        <span className="violet-summary-fault-mark" aria-hidden="true" />
+        <span className="violet-summary-fault-label">{label}</span>
+        <span className="violet-summary-fault-preview">
+          {fault.open ? '' : violetSummaryFaultPreview(fault.text)}
+        </span>
+        {fault.open && (
+          <button
+            type="button"
+            className={`violet-summary-fault-copy ${copied ? 'done' : ''}`}
+            onClick={(event) => {
+              event.stopPropagation();
+              void copy();
+            }}
+          >
+            {copied ? 'Copied' : 'Copy'}
+          </button>
+        )}
+        <svg className="violet-summary-fault-chev" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
+          <path d="M2 3.5 5 6.5 8 3.5" />
+        </svg>
+      </div>
+      {fault.open && (
+        <div className="violet-summary-fault-body">
+          <pre className="violet-summary-fault-text">{fault.text}</pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function formatSummaryTime(value: string | null | undefined, emptyLabel = 'Never'): string {
   if (!value) return emptyLabel;
   const date = new Date(value);
@@ -3022,6 +3128,11 @@ export function RightColumn({
           : ''
     }`
     : null;
+  const violetSummaryHint = violetOutstandingLabel
+    ? `${violetOutstandingLabel}${violetSummaryBusy
+      ? ` · Timeout in ${violetSummaryManualTimeoutSeconds} s`
+      : violetSummaryRunning ? '' : ' · Summary Now'}`
+    : undefined;
   const violetSummaryBullets = latestVioletSummary?.completed.length
     ? latestVioletSummary.completed.slice(0, 5)
     : ['Your auto summary will be here'];
@@ -3454,46 +3565,36 @@ export function RightColumn({
               <span className="system-agent-avatar tavern-avatar-art system-violet" aria-hidden>
                 <img src={violetAvatarUrl} alt="" />
               </span>
-              <span className="system-agent-copy violet-summary-title">
+              <span className="system-agent-copy violet-summary-title" title={violetSummaryRange ?? undefined}>
                 <b>Violet</b>
                 <small className="violet-summary-meta-line">
                   Last update <strong>{formatSummaryTime(latestVioletSummary?.updatedAt)}</strong>
                 </small>
-                {violetSummaryRange && (
-                  <small className="violet-summary-meta-line violet-summary-range" title={violetSummaryRange}>
-                    {violetSummaryRange}
-                  </small>
-                )}
               </span>
+              {violetOutstanding > 0 && (
+                <button
+                  type="button"
+                  className="violet-summary-pill"
+                  aria-label={violetSummaryHint}
+                  disabled={violetSummaryRunning}
+                  onKeyDown={(event) => event.stopPropagation()}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void runVioletSummaryNow();
+                  }}
+                >
+                  <span className="violet-summary-dot" aria-hidden="true" />
+                  <span>{violetOutstanding}</span>
+                  <span className="violet-summary-tooltip" role="tooltip">{violetSummaryHint}</span>
+                </button>
+              )}
             </div>
             <ul className="violet-summary-bullets">
               {violetSummaryBullets.map((item, index) => (
                 <li key={`${latestVioletSummary?.id ?? 'empty'}-${index}`}>{item}</li>
               ))}
             </ul>
-            {violetOutstandingLabel && (
-              <div className="violet-summary-outstanding" title={violetOutstandingLabel}>
-                {violetOutstandingLabel}
-              </div>
-            )}
-            {violetOutstanding > 0 && (
-              <button
-                type="button"
-                className="violet-summary-now"
-                disabled={violetSummaryRunning}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  void runVioletSummaryNow();
-                }}
-              >
-                {violetSummaryBusy
-                  ? `Timeout in ${violetSummaryManualTimeoutSeconds} s`
-                  : violetSummaryAutoBusy
-                    ? 'Summary Running'
-                    : 'Summary Now'}
-              </button>
-            )}
-            {violetSummaryError && <small className="violet-summary-error">{violetSummaryError}</small>}
+            <VioletSummaryFault error={violetSummaryError} provider={violetSummaryConfig.provider} />
           </section>
           <div className={`bartender-card ${status?.state ?? 'idle'} ${activeBusyAction ? 'busy' : ''}`}>
             <div className="bartender-row">

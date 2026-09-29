@@ -1,6 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { createElement } from 'react';
+import { render, screen, within } from '@testing-library/react';
+import * as ptyClient from '../src/pty-client';
+import codexIcon from '../src/assets/tavern/icons/providers/openai.svg';
 
 import {
+  VioletRoomPanel,
   mergeOlderRoomMessages,
   mergeRoomMessages,
   mergeSyncedNativeMessages,
@@ -8,6 +13,138 @@ import {
   normalizeForDedupe,
 } from '../src/chrome/VioletRoomPanel';
 import type { VioletChatMessage } from '../src/pty-client';
+import { splitLeadingEnvelopePrefix, stripLeadingTemporalGapForDisplay } from '../src/lib/violet-message-dedupe';
+
+it('splits envelope prefixes without dropping or normalizing any bytes', () => {
+  for (const prefix of ['', ' \u0015\n', '\r\n[Image #1] \t[Attachment #2]\r\n']) {
+    const body = '<KOTA_QUOTE_META v="1">\r\nbody';
+    expect(splitLeadingEnvelopePrefix(prefix + body)).toEqual({ prefix, rest: body });
+  }
+  expect(splitLeadingEnvelopePrefix('[not an attachment] body')).toEqual({ prefix: '', rest: '[not an attachment] body' });
+});
+
+describe('temporal context display', () => {
+  const gap = [
+    '<KOTA_TEMPORAL_GAP v="1" current_time="2026-09-01T12:00:00Z">',
+    'It has been over 24 hours since your last completed response in this room.',
+    '</KOTA_TEMPORAL_GAP>',
+  ].join('\n');
+
+  it('leaves text without a valid leading block unchanged', () => {
+    for (const text of ['', ' \u0015hello world\n', '[Image #1] hi', `quoted:\n${gap}\nhello`, `${gap.replace('v="1"', 'v="2"')}\nhello`]) {
+      expect(stripLeadingTemporalGapForDisplay(text)).toBe(text);
+    }
+  });
+
+  it('removes the block but preserves leading whitespace, controls and the remaining body', () => {
+    expect(stripLeadingTemporalGapForDisplay(`${gap}\nhello world`)).toBe('hello world');
+    const prefix = '\u0015 \t\n\u0000';
+    expect(stripLeadingTemporalGapForDisplay(`${prefix}${gap}\n\nhello world\n`)).toBe(`${prefix}\nhello world\n`);
+  });
+
+  it('retains provider attachment markers before the block', () => {
+    const prefix = ' \u0015[Image #1] \n[Image #2]\t';
+    expect(stripLeadingTemporalGapForDisplay(`${prefix}${gap}\nhi`)).toBe(`${prefix}hi`);
+  });
+
+  it('handles CRLF without normalizing the preserved prefix or body', () => {
+    const prefix = '\r\n[Image #1] \r\n';
+    const body = '\r\nhello\r\nworld\r\n';
+    expect(stripLeadingTemporalGapForDisplay(`${prefix}${gap.replaceAll('\n', '\r\n')}\r\n${body}`)).toBe(prefix + body);
+  });
+});
+
+it('shows the actual turn provider badge only on known-provider end-turn bubbles', async () => {
+  const projectRoot = '/tmp/fable-provider-badges';
+  const readCache = vi.spyOn(ptyClient, 'readVioletRoomCache').mockResolvedValue({
+    messages: [
+      roomMessage({ id: 'final', role: 'assistant', shell: 'codex', agentProvider: 'claude', text: 'Finished the draft.' }),
+      roomMessage({ id: 'system', role: 'assistant', shell: 'system', text: 'System notice.' }),
+      roomMessage({ id: 'unknown', role: 'assistant', shell: 'future-cli', text: 'Unknown provider reply.' }),
+      roomMessage({ id: 'progress', role: 'assistant', kind: 'commentary', shell: 'codex', text: 'Checking the draft.' }),
+      roomMessage({ id: 'user', role: 'user', shell: 'codex', text: 'Please check the draft.' }),
+    ],
+    sources: [], workEvents: [], agentBusReceipts: [],
+    rawLogDir: `${projectRoot}/project-memory/raw_logs`,
+    chathistoryDir: `${projectRoot}/project-memory/chathistory`,
+    syncedAt: '2026-05-18T08:51:27.000Z',
+  });
+  const view = render(createElement(VioletRoomPanel, { projectRoot, agentIds: ['agent-a'] }));
+  try {
+    const bubble = (await screen.findByText('Finished the draft.')).closest('.violet-msg') as HTMLElement;
+    const badge = within(bubble).getByLabelText('Codex');
+    expect(badge.parentElement).toHaveClass('violet-msg-model');
+    expect(bubble.querySelector('.violet-msg-avatar-host .provider-badge')).toBeNull();
+    expect(bubble.querySelector('.with-provider-badge')).toBeNull();
+    expect(badge.querySelector('img')).toHaveAttribute('src', codexIcon);
+    expect(badge.querySelector('img')).toHaveAttribute('width', '10');
+    expect(badge.querySelector('img')).toHaveAttribute('height', '10');
+    const tooltip = within(badge).getByRole('tooltip', { hidden: true });
+    expect(tooltip).toHaveTextContent('Codex');
+    expect(badge).toHaveAttribute('aria-describedby', tooltip.id);
+    expect(badge).toHaveAttribute('tabindex', '0');
+    for (const id of ['system', 'unknown', 'progress', 'user']) {
+      const other = view.container.querySelector(`[data-violet-message-id="${id}"]`);
+      expect(other).not.toBeNull();
+      expect(other?.querySelector('.provider-badge')).toBeNull();
+      expect(other?.querySelector('.violet-msg-model')).toBeNull();
+    }
+    expect(view.container.querySelectorAll('.provider-badge')).toHaveLength(1);
+  } finally {
+    view.unmount();
+    readCache.mockRestore();
+  }
+});
+
+it('shows an inline provider icon with optional model and effort only on known-provider end turns', async () => {
+  const projectRoot = '/tmp/fable-model-captions';
+  const readCache = vi.spyOn(ptyClient, 'readVioletRoomCache').mockResolvedValue({
+    messages: [
+      roomMessage({ id: 'caption-both', role: 'assistant', shell: 'codex', text: 'Both fields.', model: 'gpt-fable-6', effort: 'max' }),
+      roomMessage({ id: 'caption-model', role: 'assistant', shell: 'opencode', text: 'Model only.', model: 'gpt-fable-open' }),
+      roomMessage({ id: 'caption-neither', role: 'assistant', shell: 'antigravity', text: 'Unknown fields.' }),
+      roomMessage({ id: 'caption-effort-only', role: 'assistant', shell: 'antigravity', text: 'Unknown model.', effort: 'High' }),
+      roomMessage({ id: 'caption-progress', role: 'assistant', kind: 'commentary', shell: 'codex', text: 'Checking.', model: 'gpt-fable-6', effort: 'max' }),
+      roomMessage({ id: 'caption-system', role: 'assistant', shell: 'system', text: 'System notice.', model: 'ignored', effort: 'ignored' }),
+      roomMessage({ id: 'caption-unknown', role: 'assistant', shell: 'future-cli', text: 'Unknown provider.', model: 'ignored', effort: 'ignored' }),
+      roomMessage({ id: 'caption-user', role: 'user', shell: 'codex', text: 'A request.', model: 'ignored', effort: 'ignored' }),
+    ],
+    sources: [], workEvents: [], agentBusReceipts: [],
+    rawLogDir: `${projectRoot}/project-memory/raw_logs`,
+    chathistoryDir: `${projectRoot}/project-memory/chathistory`,
+    syncedAt: '2026-05-18T08:51:27.000Z',
+  });
+  const view = render(createElement(VioletRoomPanel, { projectRoot, agentIds: ['agent-a'] }));
+  try {
+    const both = (await screen.findByText('Both fields.')).closest('.violet-msg') as HTMLElement;
+    const caption = both.querySelector('.violet-msg-model');
+    expect(caption).toHaveTextContent('gpt-fable-6 • max');
+    expect(caption?.previousElementSibling).toHaveClass('violet-msg-body');
+    expect(caption?.parentElement).toHaveClass('violet-msg-content');
+    expect(caption?.firstElementChild).toHaveClass('provider-badge');
+    expect(caption?.querySelector('.provider-badge img')).toHaveAttribute('width', '10');
+    expect(caption?.querySelector('.violet-msg-model-text')).toHaveTextContent(/^gpt-fable-6 • max$/);
+    const modelOnly = (await screen.findByText('Model only.')).closest('.violet-msg') as HTMLElement;
+    expect(modelOnly.querySelector('.violet-msg-model-text')).toHaveTextContent(/^gpt-fable-open$/);
+    expect(modelOnly.querySelector('.violet-msg-effort')).toBeNull();
+    for (const id of ['caption-neither', 'caption-effort-only']) {
+      const iconOnly = view.container.querySelector(`[data-violet-message-id="${id}"] .violet-msg-model`) as HTMLElement;
+      expect(iconOnly).not.toBeNull();
+      expect(iconOnly.children).toHaveLength(1);
+      expect(within(iconOnly).getByLabelText('Antigravity CLI')).toHaveClass('provider-badge');
+      expect(iconOnly.querySelector('.violet-msg-model-text')).toBeNull();
+    }
+    for (const id of ['caption-progress', 'caption-system', 'caption-unknown', 'caption-user']) {
+      const bubble = view.container.querySelector(`[data-violet-message-id="${id}"]`);
+      expect(bubble).not.toBeNull();
+      expect(bubble?.querySelector('.violet-msg-model')).toBeNull();
+    }
+    expect(view.container.querySelectorAll('.violet-msg-model')).toHaveLength(4);
+  } finally {
+    view.unmount();
+    readCache.mockRestore();
+  }
+});
 
 describe('Violet room message dedupe', () => {
   it('matches absolute and project-memory-relative attachment prompts', () => {

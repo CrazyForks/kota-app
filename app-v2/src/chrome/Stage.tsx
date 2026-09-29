@@ -23,8 +23,11 @@ import type { AgentAtTable, OffTableAgent, WorkingHero } from '../types/agentbar
 import { WorkingHeroPicker } from './WorkingHeroPicker';
 import { AgentCommendButton } from './AgentCommendButton';
 import { ProjectAgentName } from './ProjectAgentName';
+import { ProviderBadge } from './ProviderBadge';
 import { VioletRoomPanel, type VioletComposerRetryRequest } from './VioletRoomPanel';
+import { VioletRoomSearch } from './VioletRoomSearch';
 import { ProjectRulesMedal } from './ProjectRulesMedal';
+import { ProjectSettings } from './ProjectSettings';
 import type { ProjectAgentCommendSource, ProjectAgentRecord } from '../pty-client';
 import { avatarClassForAgentFallback, avatarImageStyleForId } from '../lib/hero-avatars';
 import { useFileTreeAgentHover } from '../lib/file-tree-agent-hover';
@@ -207,12 +210,15 @@ function SeatCard({
           <i />
           <b />
         </span>
-        <div className="seat-name">
-          <ProjectAgentName name={agent.name} projectName={projectName} compact />
-          {agent.captain && <span className="seat-star">★</span>}
-          {unsupportedProvider && (
-            <span className="seat-unsupported">Unsupported · {unsupportedProvider}</span>
-          )}
+        <div className="seat-text">
+          <div className="seat-name">
+            <ProjectAgentName name={agent.name} projectName={projectName} compact />
+            {agent.captain && <span className="seat-star">★</span>}
+            {unsupportedProvider && (
+              <span className="seat-unsupported">Unsupported · {unsupportedProvider}</span>
+            )}
+          </div>
+          <ProviderBadge provider={agent.provider} size={16} />
         </div>
         {agent.captain && <div className="seat-lamp" aria-hidden>🕯</div>}
       </div>
@@ -308,6 +314,7 @@ export interface StageProps {
   unsupportedAgentProviders?: ReadonlyMap<AgentId, string>;
   agentRecords?: Readonly<Record<AgentId, ProjectAgentRecord>>;
   projectName?: string | null;
+  projectId?: string;
   onIncarnateHero?: (hero: WorkingHero, seatIndex?: number) => void;
   onOpenAgentAdd?: () => void;
   onOpenAgentSlotAdd?: (seatIndex: number) => void;
@@ -377,6 +384,7 @@ export function Stage({
   unsupportedAgentProviders = EMPTY_UNSUPPORTED_AGENT_PROVIDERS,
   agentRecords,
   projectName,
+  projectId,
   onIncarnateHero,
   onOpenAgentAdd,
   onOpenAgentSlotAdd,
@@ -404,6 +412,22 @@ export function Stage({
 }: StageProps) {
   const [privacyOpen, setPrivacyOpen] = useState(false);
   const [projectRulesOpen, setProjectRulesOpen] = useState(false);
+  // The room unmounts on Cmd+9; its search session belongs to the project, not that view.
+  const [searchScope, setSearchScope] = useState<string | null>(null);
+  useEffect(() => setSearchScope(null), [projectRoot]);
+  useEffect(() => {
+    if (!groupChatOpen || !projectRoot || searchScope) return;
+    const openSearch = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey || event.repeat
+        || event.defaultPrevented || event.isComposing || event.key.toLowerCase() !== 'f') return;
+      if (event.target instanceof Element
+        && event.target.closest('[role="dialog"], [role="menu"], .win-ime-capture')) return;
+      event.preventDefault();
+      setSearchScope(projectRoot);
+    };
+    window.addEventListener('keydown', openSearch);
+    return () => window.removeEventListener('keydown', openSearch);
+  }, [groupChatOpen, projectRoot, searchScope]);
   const [internalRecruitSeatIndex, setInternalRecruitSeatIndex] = useState<number | null>(null);
   const [roomRestoreOverlayVisible, setRoomRestoreOverlayVisible] = useState(false);
   const [roomRestoreProgressVisible, setRoomRestoreProgressVisible] = useState(false);
@@ -675,6 +699,7 @@ export function Stage({
             onChangeDeskTheme={onChangeDeskTheme}
             onChangeCenter={onChangeCenter}
           />
+          {projectId && <ProjectSettings key={projectId} projectId={projectId} projectName={projectName ?? projectId} />}
           {privacyControlsEnabled && (
             <div ref={privacyWrapRef} className="privacy-drawer">
               <button
@@ -901,8 +926,19 @@ export function Stage({
               onRetryComposerMessage={onRetryComposerMessage}
               onQuoteMessage={onQuoteMessage}
               onClose={onToggleGroupChat}
+              onSearch={projectRoot ? () => setSearchScope(projectRoot) : undefined}
             />
           </div>
+        )}
+        {searchScope && searchScope === projectRoot && (
+          <VioletRoomSearch
+            key={searchScope}
+            projectRoot={searchScope}
+            projectName={projectName}
+            agentMeta={agentMeta}
+            onQuoteMessage={onQuoteMessage}
+            onClose={() => setSearchScope(null)}
+          />
         )}
         {projectRulesOpen && (
           <ProjectRulesMedal

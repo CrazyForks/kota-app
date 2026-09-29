@@ -134,7 +134,8 @@ fn malformed_quoted_empty_and_multiple_wrappers_are_not_normalized() {
         format!("Please review:{valid}"),
         format!("{valid} trailing prose"),
         format!("```xml\n{valid}\n```"),
-        format!("{valid}{valid}"),
+        format!("{valid}between{valid}"),
+        format!("{valid}\n<pasted_content id=\"x\">\nunterminated"),
     ];
     for input in cases {
         assert_eq!(claude_pasted_input(&input), None, "{input:?}");
@@ -159,9 +160,11 @@ fn normalization_requires_typed_human_user_string_metadata() {
         }
         assert_eq!(parse(line)[0].text, input);
     }
-    // Native blocks, including tool results, retain their existing parser path.
-    let blocks = parse(record(json!([{"type": "text", "text": input}])));
-    assert_eq!(blocks[0].text, input);
+    // Input submitted while Claude is mid-turn is stamped `queued`, not `typed`.
+    let mut queued = record(json!(input));
+    queued["promptSource"] = json!("queued");
+    assert_eq!(parse(queued)[0].text, "text");
+    // Native tool blocks retain their existing parser path.
     let tools = parse(record(json!([{"type": "tool_result", "content": input}])));
     assert_eq!(tools[0].kind, "tool");
     assert_eq!(tools[0].text, input);
@@ -192,6 +195,71 @@ fn wrapped_bus_uses_existing_hidden_envelope_and_receipt_rules() {
         "agentbus-paste-test"
     );
     assert!(filter_internal_agent_bus_envelopes(pasted).is_empty());
+}
+
+#[test]
+fn queued_and_coalesced_bus_pastes_stay_hidden_with_one_receipt_each() {
+    let bus_a = "<KOTA_MESSAGE id=\"agentbus-paste-a\" from=\"agent-a\" to=\"agent-fixture73\" intent=\"handoff\">\nfirst\n</KOTA_MESSAGE>";
+    let bus_b = "<KOTA_MESSAGE id=\"agentbus-paste-b\" from=\"agent-b\" to=\"agent-fixture73\" intent=\"review\">\nsecond\n</KOTA_MESSAGE>";
+    let plain = parse(record(json!(bus_a)));
+    let mut queued = record(json!(wrapped(bus_a)));
+    queued["promptSource"] = json!("queued");
+    let queued = parse(queued);
+    assert_eq!(
+        serde_json::to_value(&queued).unwrap(),
+        serde_json::to_value(&plain).unwrap()
+    );
+    assert!(filter_internal_agent_bus_envelopes(queued).is_empty());
+
+    // Two bus deliveries can land in one Claude submission as consecutive wrappers.
+    let coalesced = format!("{}{}", wrapped(bus_a), wrapped(bus_b));
+    assert_eq!(
+        claude_pasted_inputs(&coalesced),
+        Some(vec![bus_a, bus_b])
+    );
+    let events = parse(record(json!(coalesced)));
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].text, bus_a);
+    assert_eq!(events[1].text, bus_b);
+    assert_eq!(events[0].native_event_id.as_deref(), Some("native-input:0"));
+    assert_eq!(events[1].native_event_id.as_deref(), Some("native-input:1"));
+    let receipts = events
+        .iter()
+        .filter_map(agent_bus_receipt_from_event)
+        .map(|receipt| receipt.event_id)
+        .collect::<Vec<_>>();
+    assert_eq!(receipts, ["agentbus-paste-a", "agentbus-paste-b"]);
+    assert!(filter_internal_agent_bus_envelopes(events).is_empty());
+
+    // Coalesced ordinary pastes are still plain user messages, one per paste.
+    let events = parse(record(json!(format!("{}{}", wrapped("one"), wrapped("two")))));
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].text, "one");
+    assert_eq!(events[1].text, "two");
+    assert!(events.iter().all(|event| event.role == "user" && event.kind == "message"));
+}
+
+#[test]
+fn image_attachment_pastes_unwrap_the_text_block_and_keep_the_markers() {
+    // Claude submits an attached image as blocks; the typed text follows the
+    // image block with attachment markers before the wrapper.
+    let image = json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}});
+    let text = "[Image #7]\n\n<pasted_content id=\"aa0e\">\n是这个么，但是怎么还不统一呢？\n</pasted_content id=\"aa0e\">\n";
+    let events = parse(record(json!([image, {"type": "text", "text": text}])));
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].text, "[Image #7]\n\n是这个么，但是怎么还不统一呢？");
+    assert_eq!(events[0].native_event_id.as_deref(), Some("native-input:1"));
+    assert_eq!(events[0].kind, "message");
+
+    // Non-paste text blocks and tool blocks keep their native bytes.
+    let plain = parse(record(json!([image, {"type": "text", "text": "[Image #7]\nplain"}])));
+    assert_eq!(plain[0].text, "[Image #7]\nplain");
+    let mixed = "[Image #7]\n\n<pasted_content id=\"x\">\ntext\n</pasted_content id=\"x\"> more";
+    let mixed_events = parse(record(json!([image, {"type": "text", "text": mixed}])));
+    assert_eq!(mixed_events[0].text, mixed);
+    let tools = parse(record(json!([{"type": "tool_result", "content": wrapped("text")}])));
+    assert_eq!(tools[0].kind, "tool");
+    assert_eq!(tools[0].text, wrapped("text"));
 }
 
 #[test]
@@ -281,6 +349,8 @@ fn existing_cache_stays_wrapped_and_only_new_native_lines_are_normalized() {
             offset: old_line.len() as u64,
             line_index: 1,
             updated_at: now_iso(),
+            model: None,
+            effort: None,
         },
     )
     .unwrap();

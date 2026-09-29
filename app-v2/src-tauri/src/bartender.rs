@@ -645,7 +645,16 @@ impl BartenderManager {
             });
         }
 
-        match git(&source, &["merge", "--no-ff", "--no-edit", &upstream]) {
+        let email = crate::project_settings::runtime_commit_email(
+            Path::new(&workspace.local_root),
+            "bartender@kota.local",
+        );
+        match git_with_commit_email(
+            &source,
+            &["merge", "--no-ff", "--no-edit", &upstream],
+            email.as_deref(),
+            false,
+        ) {
             Ok(_) => {
                 let new_head = source_head(&source)?;
                 for target in agent_targets(workspace) {
@@ -1012,7 +1021,11 @@ fn sync_local_inner(
         if let Some(progress) = progress {
             progress.emit("snapshot_source", "Snapshotting source changes");
         }
-        snapshot_worktree(&source, "Bartender checkpoint: room edits")?;
+        snapshot_worktree(
+            &source,
+            "Bartender checkpoint: room edits",
+            Path::new(&workspace.local_root),
+        )?;
         snapshot_count += 1;
     }
 
@@ -1032,6 +1045,7 @@ fn sync_local_inner(
             snapshot_worktree(
                 &target.path,
                 &format!("Bartender snapshot: {}", target.agent_id),
+                Path::new(&workspace.local_root),
             )?;
             snapshot_count += 1;
         }
@@ -1050,7 +1064,7 @@ fn sync_local_inner(
         let mut pass_conflicts = Vec::new();
 
         for target in remaining {
-            let outcome = publish_agent(&source, &target)?;
+            let outcome = publish_agent(&source, &target, Path::new(&workspace.local_root))?;
             if outcome.published_commits > 0 {
                 pass_published += outcome.published_commits;
                 published_commit_count += outcome.published_commits;
@@ -1166,12 +1180,22 @@ fn reset_failure_message(reset_failures: &BTreeMap<String, String>) -> String {
     )
 }
 
-fn publish_agent(source: &Path, target: &AgentSyncTarget) -> Result<PublishOutcome> {
+fn publish_agent(
+    source: &Path,
+    target: &AgentSyncTarget,
+    project_root: &Path,
+) -> Result<PublishOutcome> {
     let commits = pending_commits(source, &target.path)?;
     let mut published_commits = 0usize;
 
     for commit in commits {
-        match git(source, &["cherry-pick", &commit]) {
+        let email = crate::project_settings::runtime_commit_email(project_root, "bartender@kota.local");
+        match git_with_commit_email(
+            source,
+            &["cherry-pick", &commit],
+            email.as_deref(),
+            true,
+        ) {
             Ok(_) => {
                 published_commits += 1;
             }
@@ -1198,22 +1222,22 @@ fn publish_agent(source: &Path, target: &AgentSyncTarget) -> Result<PublishOutco
     })
 }
 
-fn snapshot_worktree(path: &Path, message: &str) -> Result<()> {
+fn snapshot_worktree(path: &Path, message: &str, project_root: &Path) -> Result<()> {
+    let email = crate::project_settings::runtime_commit_email(project_root, "bartender@kota.local");
+    let email = email.as_deref().unwrap_or("bartender@kota.local");
     git(path, &["add", "-A"])?;
     let staged = git(path, &["diff", "--cached", "--name-only"])?;
     if staged.trim().is_empty() {
         return Ok(());
     }
-    git(
+    git_with_env(
         path,
+        &["commit", "-m", message],
         &[
-            "-c",
-            "user.name=Kota Bartender",
-            "-c",
-            "user.email=bartender@kota.local",
-            "commit",
-            "-m",
-            message,
+            ("GIT_AUTHOR_NAME", "Kota Bartender"),
+            ("GIT_COMMITTER_NAME", "Kota Bartender"),
+            ("GIT_AUTHOR_EMAIL", email),
+            ("GIT_COMMITTER_EMAIL", email),
         ],
     )?;
     Ok(())
@@ -1459,6 +1483,29 @@ fn count_porcelain_changes(out: &str) -> usize {
 }
 
 fn git(path: &Path, args: &[&str]) -> Result<String> {
+    git_with_env(path, args, &[])
+}
+
+fn git_with_commit_email(
+    path: &Path,
+    args: &[&str],
+    email: Option<&str>,
+    preserve_author: bool,
+) -> Result<String> {
+    // Cherry-pick keeps the original author. A new merge commit has a new
+    // author as well as a committer. Names and existing commit objects stay intact.
+    match email {
+        Some(email) if preserve_author => git_with_env(path, args, &[("GIT_COMMITTER_EMAIL", email)]),
+        Some(email) => git_with_env(
+            path,
+            args,
+            &[("GIT_AUTHOR_EMAIL", email), ("GIT_COMMITTER_EMAIL", email)],
+        ),
+        None => git(path, args),
+    }
+}
+
+fn git_with_env(path: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
     let mut command = Command::new("git");
     configure_github_cli_credential_helper(&mut command);
     let output = command
@@ -1466,6 +1513,7 @@ fn git(path: &Path, args: &[&str]) -> Result<String> {
         .arg(path)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .envs(env.iter().copied())
         .output()
         .with_context(|| format!("run git -C {}", path.display()))?;
     if output.status.success() {
@@ -2025,6 +2073,142 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn project_commit_email_applies_to_new_snapshots_and_preserves_synced_authors() {
+        let root = temp_dir("commit-email");
+        let source = root.join("source");
+        let agent = root.join("agent");
+        fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "-b", "main"]).unwrap();
+        git(&source, &["config", "commit.gpgsign", "false"]).unwrap();
+        fs::write(source.join("initial"), "initial").unwrap();
+        snapshot_worktree(&source, "initial", &root).unwrap();
+        let initial = source_head(&source).unwrap();
+        assert_eq!(git(&source, &["log", "-1", "--format=%an|%ae|%cn|%ce"]).unwrap().trim(),
+            "Kota Bartender|bartender@kota.local|Kota Bartender|bartender@kota.local");
+
+        git(&source, &["worktree", "add", "-b", "fable-agent", agent.to_str().unwrap()]).unwrap();
+        git_with_env(&agent, &["commit", "--allow-empty", "-m", "existing author"], &[
+            ("GIT_AUTHOR_NAME", "Fable Agent"), ("GIT_COMMITTER_NAME", "Fable Agent"),
+            ("GIT_AUTHOR_EMAIL", "original@fable.example"), ("GIT_COMMITTER_EMAIL", "original@fable.example"),
+        ]).unwrap();
+        // A real change ensures the normal sync path, rather than an empty cherry-pick.
+        fs::write(agent.join("agent-change"), "hello").unwrap();
+        git(&agent, &["add", "-A"]).unwrap();
+        git_with_env(&agent, &["commit", "-m", "agent work"], &[
+            ("GIT_AUTHOR_NAME", "Fable Agent"), ("GIT_COMMITTER_NAME", "Fable Agent"),
+            ("GIT_AUTHOR_EMAIL", "original@fable.example"), ("GIT_COMMITTER_EMAIL", "original@fable.example"),
+        ]).unwrap();
+        crate::project_settings::save_commit_email(&root, Some("arbitrary-string".into())).unwrap();
+        fs::write(source.join("room-change"), "room").unwrap();
+        snapshot_worktree(&source, "room checkpoint", &root).unwrap();
+        assert_eq!(git(&source, &["log", "-1", "--format=%an|%ae|%cn|%ce"]).unwrap().trim(),
+            "Kota Bartender|arbitrary-string|Kota Bartender|arbitrary-string");
+        let mut workspace = workspace_without_agents(&root, &source);
+        workspace.agents = workspace_with_agent(&root, &source, &root.join("agent-cwd"), &agent).agents;
+        let outcome = sync_local_inner(&workspace, None).unwrap();
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(git(&source, &["log", "-1", "--format=%an|%ae|%ce"]).unwrap().trim(),
+            "Fable Agent|original@fable.example|arbitrary-string");
+        assert_eq!(git(&source, &["show", "-s", "--format=%ae", &initial]).unwrap().trim(), "bartender@kota.local");
+        let head = source_head(&source).unwrap();
+        assert!(sync_local_inner(&workspace, None).unwrap().ok);
+        assert_eq!(source_head(&source).unwrap(), head);
+        crate::project_settings::save_commit_email(&root, None).unwrap();
+        fs::write(source.join("after-remove"), "removed").unwrap();
+        snapshot_worktree(&source, "after remove", &root).unwrap();
+        assert_eq!(git(&source, &["log", "-1", "--format=%ae|%ce"]).unwrap().trim(), "bartender@kota.local|bartender@kota.local");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_commit_email_applies_to_pull_merge_with_local_remote() {
+        check_project_commit_email_pull_merge(false);
+    }
+
+    #[test]
+    fn project_commit_email_corrupt_settings_allow_default_pull_merge() {
+        check_project_commit_email_pull_merge(true);
+    }
+
+    fn check_project_commit_email_pull_merge(corrupt_settings: bool) {
+        let root = temp_dir("commit-email-merge");
+        let source = root.join("source");
+        let remote = root.join("remote.git");
+        let peer = root.join("peer");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&remote).unwrap();
+        git(&source, &["init", "-b", "main"]).unwrap();
+        git(&source, &["config", "commit.gpgsign", "false"]).unwrap();
+        git(&remote, &["init", "--bare", "-b", "main"]).unwrap();
+        fs::write(source.join("initial"), "initial").unwrap();
+        snapshot_worktree(&source, "initial", &root).unwrap();
+        git(&source, &["remote", "add", "origin", remote.to_str().unwrap()]).unwrap();
+        git(&source, &["push", "-u", "origin", "main"]).unwrap();
+        git(&root, &["clone", remote.to_str().unwrap(), peer.to_str().unwrap()]).unwrap();
+        git(&peer, &["config", "commit.gpgsign", "false"]).unwrap();
+        fs::write(peer.join("peer-change"), "peer").unwrap();
+        snapshot_worktree(&peer, "peer change", &root).unwrap();
+        let peer_head = source_head(&peer).unwrap();
+        git(&peer, &["push", "origin", "main"]).unwrap();
+        fs::write(source.join("local-change"), "local").unwrap();
+        snapshot_worktree(&source, "local change", &root).unwrap();
+        let local_head = source_head(&source).unwrap();
+        let expected_email = if corrupt_settings {
+            fs::write(root.join("project-settings.json"), "broken").unwrap();
+            "bartender@kota.local"
+        } else {
+            crate::project_settings::save_commit_email(&root, Some("merge@fable.example".into())).unwrap();
+            "merge@fable.example"
+        };
+        let workspace = workspace_without_agents(&root, &source);
+        let result = BartenderManager::default().pull_from_github(&workspace).unwrap();
+        assert!(result.ok, "{}", result.message);
+        assert_eq!(git(&source, &["log", "-1", "--format=%ae|%ce"]).unwrap().trim(),
+            format!("{expected_email}|{expected_email}"));
+        assert_eq!(git(&source, &["log", "-1", "--format=%P"]).unwrap().trim(),
+            format!("{local_head} {peer_head}"));
+        for parent in [&local_head, &peer_head] {
+            assert_eq!(git(&source, &["show", "-s", "--format=%ae", parent]).unwrap().trim(),
+                "bartender@kota.local");
+        }
+        let head = source_head(&source).unwrap();
+        assert!(BartenderManager::default().pull_from_github(&workspace).unwrap().ok);
+        assert_eq!(source_head(&source).unwrap(), head);
+        if corrupt_settings {
+            assert_eq!(fs::read_to_string(root.join("project-settings.json")).unwrap(), "broken");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_commit_email_corrupt_settings_allow_default_bartender_sync() {
+        let root = temp_dir("commit-email-corrupt");
+        let source = root.join("source");
+        let agent = root.join("agent");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(root.join("project-settings.json"), "broken").unwrap();
+        git(&source, &["init", "-b", "main"]).unwrap();
+        git(&source, &["config", "commit.gpgsign", "false"]).unwrap();
+        git(&source, &["config", "user.email", "unrelated@fable.example"]).unwrap();
+        fs::write(source.join("initial"), "initial").unwrap();
+        snapshot_worktree(&source, "initial", &root).unwrap();
+        assert_eq!(git(&source, &["log", "-1", "--format=%an|%ae|%cn|%ce"]).unwrap().trim(),
+            "Kota Bartender|bartender@kota.local|Kota Bartender|bartender@kota.local");
+        git(&source, &["worktree", "add", "-b", "fable-agent", agent.to_str().unwrap()]).unwrap();
+        fs::write(agent.join("agent-change"), "hello").unwrap();
+        let workspace = workspace_with_agent(&root, &source, &root.join("agent-cwd"), &agent);
+        let outcome = sync_local_inner(&workspace, None).unwrap();
+        assert!(outcome.ok, "{}", outcome.message);
+        assert_eq!(git(&source, &["log", "-1", "--format=%ae|%ce"]).unwrap().trim(),
+            "bartender@kota.local|bartender@kota.local");
+        // Runtime fallback does not repair or discard a broken preference.
+        assert!(crate::project_settings::read(&root).is_err());
+        assert!(crate::project_settings::save_commit_email(&root, None).is_err());
+        assert_eq!(fs::read_to_string(root.join("project-settings.json")).unwrap(), "broken");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn counts_porcelain_lines() {

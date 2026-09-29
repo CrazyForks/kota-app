@@ -476,6 +476,18 @@ impl HttpClient {
         authorized: MembershipCheck,
         deadline: Instant,
     ) -> Result<Reply> {
+        self.submit(request, body, cancel, authorized, deadline)?.wait().await
+    }
+    /// The same bounded admission used by execute, exposed before waiting so
+    /// a coordinator can commit ownership only after a job really is queued.
+    pub(super) fn submit(
+        &self,
+        request: SignedRequest,
+        body: Option<Body>,
+        cancel: Cancellation,
+        authorized: MembershipCheck,
+        deadline: Instant,
+    ) -> Result<PendingHttp> {
         self.admission(
             request.small_request(),
             request.response_limit(),
@@ -484,8 +496,7 @@ impl HttpClient {
             authorized,
             deadline,
         )?
-        .execute(request, body)
-        .await
+        .submit(request, body)
     }
     /// Reserve BEFORE constructing a send batch, so retained ciphertext cannot
     /// consume the bytes required to submit itself. No HTTP/timer is started.
