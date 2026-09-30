@@ -326,6 +326,7 @@ export interface StageProps {
   /** Double-click seat / ribbon → focus terminal. */
   onDblClickAgent?: (id: AgentId) => void;
   onOpenAgentTerminal?: (id: AgentId) => void;
+  onRefreshAgentSession?: (id: AgentId) => void;
   onRetryComposerMessage?: (request: VioletComposerRetryRequest) => boolean | void | Promise<boolean | void>;
   onQuoteMessage?: (quote: RoomQuoteReference) => RoomQuoteInsertResult;
   /** Group chat overlay. */
@@ -394,6 +395,7 @@ export function Stage({
   onRecruitSeatIndexChange,
   onDblClickAgent,
   onOpenAgentTerminal,
+  onRefreshAgentSession,
   onRetryComposerMessage,
   onQuoteMessage,
   groupChatOpen = false,
@@ -923,6 +925,7 @@ export function Stage({
               onAgentContextMenu={onAgentContextMenu}
               onCommendAgent={onCommendAgent}
               onOpenAgentTerminal={onOpenAgentTerminal}
+              onRefreshAgentSession={onRefreshAgentSession}
               onRetryComposerMessage={onRetryComposerMessage}
               onQuoteMessage={onQuoteMessage}
               onClose={onToggleGroupChat}

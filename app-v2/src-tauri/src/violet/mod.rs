@@ -81,6 +81,9 @@ const EMBER_DREAM_EMPTY_MARKER: &str = "__KOTA_DREAM_NONE__";
 const TURN_ABORTED_ROOM_TEXT: &str = "interrupted the previous turn per human request";
 const CODEX_INTERNAL_PROGRESS_FORMAT_WARNING: &str =
     "Codex emitted an unrecognized internal progress format. Raw event retained in native logs.";
+const CODEX_SANDBOX_DOWNGRADE_INTENT: &str = "sandbox-downgrade";
+const CODEX_SANDBOX_DOWNGRADE_TEXT: &str =
+    "Codex session lost room access after a Codex update — refresh session to restore.";
 const KIMI_UNKNOWN_EVENT_WARNING: &str =
     "Kimi Code emitted an unrecognized native event. Raw event retained in native logs.";
 const EMBER_DREAM_MAX_ACTIVE_ENTRIES: usize = 15;
@@ -462,6 +465,8 @@ enum RoomExceptionReshape {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct NativeEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    actor_intent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     effort: Option<String>,
@@ -623,12 +628,15 @@ struct SourceCursor {
     model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_sandbox_policy: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
 struct MessageModel {
     model: Option<String>,
     effort: Option<String>,
+    codex_sandbox_policy: Option<String>,
 }
 
 impl MessageModel {
@@ -639,11 +647,19 @@ impl MessageModel {
         }
     }
 
-    fn observe_jsonl(&mut self, shell: &str, json: &JsonValue) {
+    fn observe_jsonl(&mut self, shell: &str, json: &JsonValue) -> bool {
+        let mut sandbox_downgraded = false;
         match (shell, json.get("type").and_then(JsonValue::as_str)) {
             ("codex", Some("turn_context")) => {
                 self.model = json_string(json, &["payload", "model"]);
                 self.effort = json_string(json, &["payload", "effort"]);
+                let policy = json_string(json, &["payload", "sandbox_policy", "type"]);
+                sandbox_downgraded =
+                    self.codex_sandbox_policy.as_deref() == Some("danger-full-access")
+                        && policy.as_deref() == Some("workspace-write");
+                // A missing or unknown policy breaks the explicit transition.
+                // permission_profile=managed alone does not identify a sandbox.
+                self.codex_sandbox_policy = policy;
             }
             ("kimi", Some("llm.request")) => {
                 self.model = json_string(json, &["model"]);
@@ -658,6 +674,7 @@ impl MessageModel {
             }
             _ => {}
         }
+        sandbox_downgraded
     }
 }
 
@@ -684,6 +701,7 @@ fn antigravity_message_model(text: &str) -> Option<MessageModel> {
     Some(MessageModel {
         model: Some(model.to_string()),
         effort,
+        ..MessageModel::default()
     })
 }
 
@@ -3578,6 +3596,7 @@ fn parse_pi_source(
         let caption = MessageModel {
             model: json_string(&entry.json, &["message", "model"]),
             effort: effort.clone(),
+            ..MessageModel::default()
         };
         for event in &mut parsed {
             caption.apply(event);
@@ -3898,6 +3917,7 @@ where
         .map(|cursor| MessageModel {
             model: cursor.model.clone(),
             effort: cursor.effort.clone(),
+            codex_sandbox_policy: cursor.codex_sandbox_policy.clone(),
         })
         .unwrap_or_default();
     let read = if reset_cache {
@@ -3925,7 +3945,14 @@ where
                 continue;
             }
         };
-        message_model.observe_jsonl(&agent.shell, &json);
+        let sandbox_downgraded = message_model.observe_jsonl(&agent.shell, &json);
+        // Initial tail scans and source resets establish a baseline only.
+        // Existing cursors keep their offset; never replay history to backfill.
+        if sandbox_downgraded && !reset_cache {
+            if let Some(notice) = codex_sandbox_downgrade_event(agent, source, &json) {
+                parsed_new.push(notice);
+            }
+        }
         let mut events = parser(agent, source, index, json);
         if matches!(agent.shell.as_str(), "codex" | "kimi" | "antigravity") {
             for event in &mut events {
@@ -3954,6 +3981,7 @@ where
             updated_at: now_iso(),
             model: message_model.model,
             effort: message_model.effort,
+            codex_sandbox_policy: message_model.codex_sandbox_policy,
         },
     )?;
     Ok(tail_events(cached, SOURCE_EVENT_LIMIT * 4))
@@ -4282,6 +4310,7 @@ fn parse_claude_line(
     let caption = MessageModel {
         model: json_string(&json, &["message", "model"]).filter(|model| model != "<synthetic>"),
         effort: json_string(&json, &["effort"]),
+        ..MessageModel::default()
     };
     for event in &mut events {
         caption.apply(event);
@@ -4763,6 +4792,34 @@ fn persist_room_exception_png(project_root: &Path, bytes: &[u8]) -> Result<Strin
     }
     write_if_changed(&path, bytes).map_err(|_| "artifact_write_failed")?;
     Ok(relative_path)
+}
+
+fn codex_sandbox_downgrade_event(
+    agent: &ProjectAgent,
+    source: &NativeSource,
+    json: &JsonValue,
+) -> Option<NativeEvent> {
+    let timestamp = json_string(json, &["timestamp"])?;
+    DateTime::parse_from_rfc3339(&timestamp).ok()?;
+    let turn_id = json_string(json, &["payload", "turn_id"]).filter(|id| !id.trim().is_empty());
+    let identity = turn_id
+        .clone()
+        .unwrap_or_else(|| format!("{:x}", Sha256::digest(timestamp.as_bytes())));
+    let id = format!("sandbox-downgrade:{}:{identity}", source.session_id);
+    let mut notice = event(
+        agent,
+        source,
+        "system",
+        "message",
+        &timestamp,
+        &id,
+        CODEX_SANDBOX_DOWNGRADE_TEXT.into(),
+    );
+    // Preserve the native time, including its precision; never invent a time.
+    notice.timestamp = timestamp;
+    notice.actor_intent = Some(CODEX_SANDBOX_DOWNGRADE_INTENT.into());
+    notice.turn_id = turn_id;
+    Some(notice)
 }
 
 fn parse_codex_line(
@@ -5415,6 +5472,7 @@ fn parse_opencode_sqlite(
         let caption = MessageModel {
             model: json_string(&json, &["modelID"]),
             effort: None,
+            ..MessageModel::default()
         };
         prepare_opencode_message_parts(&role, &json, &mut parts);
         if parts.is_empty() {
@@ -5551,6 +5609,7 @@ fn opencode_permission_event_from_log_line(
     );
 
     Some(NativeEvent {
+        actor_intent: None,
         model: None,
         effort: None,
         shell_handoff: None,
@@ -5650,6 +5709,7 @@ fn parse_opencode_message_dir(
         let caption = MessageModel {
             model: json_string(&json, &["modelID"]),
             effort: None,
+            ..MessageModel::default()
         };
         prepare_opencode_message_parts(&role, &json, &mut parts);
         if parts.is_empty() {
@@ -6238,6 +6298,7 @@ fn event(
         _ => None,
     };
     NativeEvent {
+        actor_intent: None,
         model: None,
         effort: None,
         shell_handoff,
@@ -6289,6 +6350,7 @@ fn control_event(
     turn_id: Option<String>,
 ) -> NativeEvent {
     NativeEvent {
+        actor_intent: None,
         model: None,
         effort: None,
         shell_handoff: None,
@@ -6596,6 +6658,9 @@ fn sort_chathistory_events(events: &mut Vec<ChathistoryEvent>) {
 }
 
 fn room_message_dedupe_key(message: &VioletChatMessage) -> String {
+    if message.actor_intent.as_deref() == Some(CODEX_SANDBOX_DOWNGRADE_INTENT) {
+        return message.id.clone();
+    }
     if message.temporal_gap.is_some() && message.agent_id == "user" {
         return format!("composer:{}", message.id);
     }
@@ -6638,6 +6703,11 @@ fn dedupe_native_events(mut events: Vec<NativeEvent>) -> Vec<NativeEvent> {
 }
 
 fn native_event_dedupe_key(event: &NativeEvent) -> String {
+    if event.actor_intent.as_deref() == Some(CODEX_SANDBOX_DOWNGRADE_INTENT) {
+        if let Some(id) = &event.native_event_id {
+            return id.clone();
+        }
+    }
     if event.message_origin.as_deref() == Some("shell_handoff") {
         return format!("{}: {}", event.agent_id, event.native_event_id.as_deref().unwrap_or_default());
     }
@@ -9570,7 +9640,11 @@ fn looks_like_legacy_tool_block(content: &str, metadata: &str) -> bool {
 fn event_to_message(event: NativeEvent) -> VioletChatMessage {
     VioletChatMessage {
         temporal_gap: None,
-        id: if event.message_origin.as_deref() == Some("shell_handoff") {
+        id: if let Some(id) = event.native_event_id.as_ref().filter(|_| {
+            event.actor_intent.as_deref() == Some(CODEX_SANDBOX_DOWNGRADE_INTENT)
+        }) {
+            id.clone()
+        } else if event.message_origin.as_deref() == Some("shell_handoff") {
             stable_message_id("shell-handoff", &event.agent_id, "", event.native_event_id.as_deref().unwrap_or_default())
         } else {
             stable_message_id(&event.session_id, &event.agent_id, &event.timestamp, &event.text)
@@ -9585,7 +9659,7 @@ fn event_to_message(event: NativeEvent) -> VioletChatMessage {
         source_path: Some(path_string(&event.source_path)),
         native_event_id: event.native_event_id,
         violet_seq: None,
-        actor_intent: None,
+        actor_intent: event.actor_intent,
         message_origin: event.message_origin,
         model: event.model,
         effort: event.effort,
@@ -10820,6 +10894,7 @@ mod tests {
 
     fn native_event(role: &str, kind: &str, text: &str) -> NativeEvent {
         NativeEvent {
+            actor_intent: None,
             model: None,
             effort: None,
             shell_handoff: None,
@@ -14165,6 +14240,7 @@ done"#;
     #[test]
     fn bootstrap_filter_drops_codex_setup_events() {
         let task_started = NativeEvent {
+            actor_intent: None,
             model: None,
             effort: None,
             shell_handoff: None,
@@ -15480,3 +15556,6 @@ mod claude_paste_tests;
 
 #[cfg(test)]
 mod model_effort_tests;
+
+#[cfg(test)]
+mod sandbox_downgrade_tests;

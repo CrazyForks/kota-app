@@ -3201,7 +3201,7 @@ describe('W3+W5 · composer target picker', () => {
     emitVioletComposerSent({
       projectRoot: '/tmp/river-archive',
       text: '再来一个',
-      targetAgentIds: ['agent-764ad85d1e'],
+      targetAgentIds: ['agent-1234567890'],
       privacy: false,
     });
 
@@ -3214,7 +3214,7 @@ describe('W3+W5 · composer target picker', () => {
     const { rerender } = render(
       <VioletRoomPanel
         projectRoot="/tmp/river-archive"
-        agentIds={['agent-764ad85d1e']}
+        agentIds={['agent-1234567890']}
       />,
     );
 
@@ -3222,7 +3222,7 @@ describe('W3+W5 · composer target picker', () => {
       emitVioletComposerSent({
         projectRoot: '/tmp/river-archive',
         text: '再来一个',
-        targetAgentIds: ['agent-764ad85d1e'],
+        targetAgentIds: ['agent-1234567890'],
         privacy: false,
       });
     });
@@ -3232,7 +3232,7 @@ describe('W3+W5 · composer target picker', () => {
     rerender(
       <VioletRoomPanel
         projectRoot="/tmp/kota-test"
-        agentIds={['agent-99d1b25ab6']}
+        agentIds={['agent-a1b2c3d4e5']}
       />,
     );
 
@@ -6384,6 +6384,62 @@ describe('Project agent hydration recovery', () => {
       expect(loadDetail).not.toHaveBeenCalled();
 
       fireEvent.keyDown(window, { key: '1', metaKey: true });
+      expect(resolveLaunch).not.toHaveBeenCalled();
+    } finally {
+      view.unmount();
+      restoreStorage();
+    }
+  });
+
+  it('refreshes an offline agent from the sandbox notice through the existing Fresh confirmation', async () => {
+    const workspace = hydrationWorkspace('sandbox-notice', ['agent-alpha']);
+    const { restoreStorage } = mockWorkspaceBootstrap(workspace);
+    vi.spyOn(ptyClient, 'inspectProjectAgentIdentities').mockResolvedValue({
+      identities: [hydrationIdentity('agent-alpha', 'Alpha')],
+      workspaceEntryCount: 1,
+    });
+    const detail = hydrationDetail('agent-alpha', workspace.localRoot, 'Alpha');
+    vi.spyOn(ptyClient, 'loadProjectAgentDetail').mockResolvedValue(detail);
+    vi.spyOn(ptyClient, 'readVioletRoomCache').mockResolvedValue({
+      messages: [{
+        id: 'sandbox-downgrade:session-fixture:turn-fixture',
+        sessionId: 'session-fixture', agentId: 'agent-alpha', shell: 'codex',
+        role: 'system', kind: 'message', actorIntent: 'sandbox-downgrade',
+        timestamp: '2026-09-29T10:00:00Z',
+        text: 'Codex session lost room access after a Codex update — refresh session to restore.',
+      }],
+      sources: [], workEvents: [], agentBusReceipts: [],
+      rawLogDir: `${workspace.localRoot}/project-memory/raw_logs`,
+      chathistoryDir: `${workspace.localRoot}/project-memory/chathistory`,
+      syncedAt: '2026-09-29T10:00:01Z',
+    });
+    const startFresh = vi.spyOn(ptyClient, 'startFreshProjectAgentSession').mockResolvedValue({
+      detail,
+      request: { ...workspace.agents[0]!, cli: 'codex', sessionId: null, freshSession: true },
+    });
+    const resolveLaunch = vi.spyOn(ptyClient, 'resolveProjectAgentLaunch');
+    const spawnAgent = vi.spyOn(ptyClient, 'spawnAgentPty');
+    const view = render(<App />);
+    try {
+      await screen.findByTestId('chip-agent-alpha');
+      await waitFor(() => expect(view.container.querySelector('.stage')).not.toHaveAttribute('aria-busy'));
+      expect(spawnAgent).not.toHaveBeenCalled();
+      await userEvent.click(screen.getByTestId('group-chat-trigger'));
+      await userEvent.click(await screen.findByRole('button', { name: 'Refresh session' }));
+      let dialog = await screen.findByRole('dialog', { name: 'Start fresh session for Alpha?' });
+      expect(within(dialog).getByText(
+        'This will end the current terminal session and apply the saved provider, model, and effort in a fresh session. Your identity, Ghost, workspace files, and project memory stay unchanged.',
+      )).toBeInTheDocument();
+      await userEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+      expect(startFresh).not.toHaveBeenCalled();
+      expect(spawnAgent).not.toHaveBeenCalled();
+
+      await userEvent.click(screen.getByRole('button', { name: 'Refresh session' }));
+      dialog = await screen.findByRole('dialog', { name: 'Start fresh session for Alpha?' });
+      await userEvent.click(within(dialog).getByRole('button', { name: 'Start Fresh Session' }));
+      await waitFor(() => expect(spawnAgent).toHaveBeenCalledOnce());
+      expect(startFresh).toHaveBeenCalledExactlyOnceWith({ agentId: 'agent-alpha', projectRoot: null });
+      expect(spawnAgent.mock.calls[0][0].freshSession).toBe(true);
       expect(resolveLaunch).not.toHaveBeenCalled();
     } finally {
       view.unmount();

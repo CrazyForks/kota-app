@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createElement } from 'react';
-import { render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import * as ptyClient from '../src/pty-client';
 import codexIcon from '../src/assets/tavern/icons/providers/openai.svg';
 
 import {
   VioletRoomPanel,
+  VioletMessageBubble,
   mergeOlderRoomMessages,
   mergeRoomMessages,
   mergeSyncedNativeMessages,
@@ -14,6 +15,74 @@ import {
 } from '../src/chrome/VioletRoomPanel';
 import type { VioletChatMessage } from '../src/pty-client';
 import { splitLeadingEnvelopePrefix, stripLeadingTemporalGapForDisplay } from '../src/lib/violet-message-dedupe';
+
+describe('Codex sandbox notice', () => {
+  const notice = roomMessage({
+    id: 'sandbox-downgrade:session-fixture:turn-fixture',
+    role: 'system',
+    shell: 'codex',
+    actorIntent: 'sandbox-downgrade',
+    agentDisplayName: 'Former name',
+    text: 'Codex session lost room access after a Codex update — refresh session to restore.',
+  });
+  const agentMeta = {
+    'agent-a': { name: 'Ada', emoji: 'A', role: 'Engineer', hue: '#fff', avatarClass: 'provider-codex' },
+  };
+
+  it('keeps the notice through room merging and filters, with a wrapping non-quoteable refresh action', async () => {
+    const merged = mergeRoomMessages([notice], []);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]?.ghostSasayaki).not.toBe(true);
+    const projectRoot = '/tmp/fable-sandbox-notice';
+    const readCache = vi.spyOn(ptyClient, 'readVioletRoomCache').mockResolvedValue({
+      messages: [notice], sources: [], workEvents: [], agentBusReceipts: [],
+      rawLogDir: `${projectRoot}/project-memory/raw_logs`,
+      chathistoryDir: `${projectRoot}/project-memory/chathistory`,
+      syncedAt: notice.timestamp,
+    });
+    const onRefreshAgentSession = vi.fn();
+    const onOpenAgentTerminal = vi.fn();
+    const onQuoteMessage = vi.fn(() => 'inserted' as const);
+    const view = render(createElement(VioletRoomPanel, {
+      projectRoot, agentIds: ['agent-a'], agentMeta,
+      chatFilterActive: true, chatFilterAgentIds: ['agent-a'],
+      showAgentToAgentMessages: false,
+      onRefreshAgentSession, onOpenAgentTerminal, onQuoteMessage,
+    }));
+    try {
+      view.container.style.width = '520px';
+      const refresh = await screen.findByRole('button', { name: 'Refresh session' });
+      const line = refresh.closest('article')!;
+      expect(line).toHaveClass('violet-msg', 'system-line', 'sandbox-downgrade');
+      expect(refresh.parentElement).toHaveClass('violet-system-line-text');
+      expect(refresh).toHaveClass('violet-sandbox-refresh');
+      expect(line).toHaveTextContent('Ada lost room access after a Codex update — Refresh session to restore.');
+      expect(line).toHaveAttribute('data-violet-message-id', notice.id);
+      expect(line.querySelector('.violet-msg-avatar-host, .provider-badge, .ghost-sasayaki')).toBeNull();
+      expect(within(line).queryByRole('button', { name: /quote/i })).toBeNull();
+      expect(refresh).toBeEnabled();
+      fireEvent.click(refresh);
+      expect(onRefreshAgentSession).toHaveBeenCalledExactlyOnceWith('agent-a');
+      expect(onOpenAgentTerminal).not.toHaveBeenCalled();
+      expect(onQuoteMessage).not.toHaveBeenCalled();
+    } finally {
+      view.unmount();
+      readCache.mockRestore();
+    }
+  });
+
+  it('uses the current name, then the event snapshot, then the agent id', () => {
+    const props = { message: notice, humanTargetName: 'Human Tester' };
+    const view = render(createElement(VioletMessageBubble, { ...props, agentMeta }));
+    expect(view.container.querySelector('strong')).toHaveTextContent('Ada');
+    view.rerender(createElement(VioletMessageBubble, props));
+    expect(view.container.querySelector('strong')).toHaveTextContent('Former name');
+    view.rerender(createElement(VioletMessageBubble, {
+      ...props, message: { ...notice, agentDisplayName: null },
+    }));
+    expect(view.container.querySelector('strong')).toHaveTextContent('agent-a');
+  });
+});
 
 it('splits envelope prefixes without dropping or normalizing any bytes', () => {
   for (const prefix of ['', ' \u0015\n', '\r\n[Image #1] \t[Attachment #2]\r\n']) {

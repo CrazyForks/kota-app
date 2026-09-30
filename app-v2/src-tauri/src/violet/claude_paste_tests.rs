@@ -351,6 +351,7 @@ fn existing_cache_stays_wrapped_and_only_new_native_lines_are_normalized() {
             updated_at: now_iso(),
             model: None,
             effort: None,
+            codex_sandbox_policy: None,
         },
     )
     .unwrap();

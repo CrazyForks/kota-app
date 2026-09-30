@@ -4342,7 +4342,7 @@ mod tests {
         let panel = LmPanelSession {
             revision: u64::MAX,
             projects: vec![("id".into(), "/root".into(), "名字很长的项目名字很长".into())],
-            agents: vec![("agent-490e160d76".into(), "肥波".into()); 8],
+            agents: vec![("agent-a1b2c3d4e5".into(), "肥波".into()); 8],
             ..Default::default()
         };
         let (_, markup) = agent_panel(&panel, "项目");

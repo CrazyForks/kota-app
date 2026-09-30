@@ -51,6 +51,8 @@ afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(
 
 describe('project room search', () => {
   it('repeats the full date and room-formatted clock on each result, leaving context timestamps unchanged', async () => {
+    // Reinstall the clock: beforeEach only fakes timeout functions, not Date.
+    vi.useRealTimers();
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     vi.setSystemTime(new Date(2026, 8, 28, 12));
     const today = message('today', 'First matching result', { timestamp: new Date(2026, 8, 28, 9, 42).toISOString() });

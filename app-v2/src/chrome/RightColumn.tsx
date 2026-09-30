@@ -101,6 +101,7 @@ import { BbsSyncScope, BbsSyncControlButton, BbsSyncActivity, BbsThreadSharing }
 import { LaughingManSettings } from './LaughingManSettings';
 import { MarkdownText } from './VioletRoomPanel';
 import { EmberScheduleInstrument } from './EmberScheduleInstrument';
+import { KotaVersionLabel } from './KotaVersionLabel';
 import type { Agent, AgentId } from '../types/scene';
 import type { LogRow as LogRowType } from '../types/scene';
 import { avatarClassForAgentFallback, avatarClassForId, avatarImageStyleForId } from '../lib/hero-avatars';
@@ -3982,6 +3983,7 @@ export function RightColumn({
           {footerSlot && <div className="sr-footer-slot">{footerSlot}</div>}
         </div>
       </div>
+      <KotaVersionLabel />
     </aside>
     {emberModalOpen && (
       <div className="ember-modal-shade" role="presentation">

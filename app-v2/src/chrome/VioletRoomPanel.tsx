@@ -82,6 +82,7 @@ interface VioletRoomPanelProps {
   ) => void;
   onCommendAgent?: (id: AgentId, source: ProjectAgentCommendSource) => void;
   onOpenAgentTerminal?: (id: AgentId) => void;
+  onRefreshAgentSession?: (id: AgentId) => void;
   onRetryComposerMessage?: (request: VioletComposerRetryRequest) => boolean | void | Promise<boolean | void>;
   onQuoteMessage?: (quote: RoomQuoteReference) => RoomQuoteInsertResult;
   onClose?: () => void;
@@ -223,6 +224,7 @@ export function VioletRoomPanel({
   onAgentContextMenu,
   onCommendAgent,
   onOpenAgentTerminal,
+  onRefreshAgentSession,
   onRetryComposerMessage,
   onQuoteMessage,
   onClose,
@@ -1221,6 +1223,7 @@ export function VioletRoomPanel({
               onAgentContextMenu={onAgentContextMenu}
               onCommendAgent={onCommendAgent}
               onOpenAgentTerminal={onOpenAgentTerminal}
+              onRefreshAgentSession={onRefreshAgentSession}
               onRetryComposerMessage={retryComposerMessage}
               onRetryAgentBusMessage={retryAgentBusMessage}
               onQuoteMessage={onQuoteMessage ? insertRoomQuote : undefined}
@@ -1261,6 +1264,7 @@ export const VioletMessageBubble = memo(function VioletMessageBubble({
   onAgentContextMenu,
   onCommendAgent,
   onOpenAgentTerminal,
+  onRefreshAgentSession,
   onRetryComposerMessage,
   onRetryAgentBusMessage,
   onQuoteMessage,
@@ -1279,6 +1283,7 @@ export const VioletMessageBubble = memo(function VioletMessageBubble({
   ) => void;
   onCommendAgent?: (id: AgentId, source: ProjectAgentCommendSource) => void;
   onOpenAgentTerminal?: (id: AgentId) => void;
+  onRefreshAgentSession?: (id: AgentId) => void;
   onRetryComposerMessage?: (message: VioletRoomMessage) => void;
   onRetryAgentBusMessage?: (message: VioletRoomMessage) => void;
   onQuoteMessage?: (quote: RoomQuoteReference) => void;
@@ -1304,6 +1309,25 @@ export const VioletMessageBubble = memo(function VioletMessageBubble({
           <strong>{turnInterruptActorLabel(message, agentMeta)}</strong>
           {' '}
           interrupted the previous turn per human request
+        </span>
+      </article>
+    );
+  }
+  if (message.actorIntent === 'sandbox-downgrade') {
+    return (
+      <article className="violet-msg system-line sandbox-downgrade" data-violet-message-id={message.id}>
+        <span className="violet-system-line-text">
+          <span className="violet-sandbox-notice-mark" aria-hidden="true" />
+          <strong>{turnInterruptActorLabel(message, agentMeta)}</strong>
+          {' lost room access after a Codex update — '}
+          <button
+            type="button"
+            className="violet-sandbox-refresh"
+            onClick={() => onRefreshAgentSession?.(message.agentId)}
+          >
+            Refresh session
+          </button>
+          {' to restore.'}
         </span>
       </article>
     );

@@ -4362,6 +4362,7 @@ export function App() {
                     onOpenRibbonAgent={handleRibbonAgentClick}
                     onDblClickAgent={handleSeatDblClick}
                     onOpenAgentTerminal={openAgentTerminalFromMenu}
+                    onRefreshAgentSession={handleStartFreshSession}
                     onRetryComposerMessage={handleRetryComposerMessage}
                     onQuoteMessage={insertComposerQuote}
                     onTogglePrivacyAgent={PRIVATE_CHAT_UI_ENABLED ? togglePrivacyAgent : undefined}

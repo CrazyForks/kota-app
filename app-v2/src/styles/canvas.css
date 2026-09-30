@@ -4755,7 +4755,8 @@ body::before {
   visibility: hidden;
   pointer-events: none;
 }
-.sidebar-right.night-active .sr-footer-slot {
+.sidebar-right.night-active .sr-footer-slot,
+.sidebar-right.night-active > .kota-version-label {
   visibility: hidden;
   pointer-events: none;
 }
@@ -5160,6 +5161,7 @@ body::before {
 }
 .sr-body {
   flex: 1; overflow-y: auto;
+  min-height: 0;
   padding: 12px;
 }
 .system-agent-stack {
@@ -12347,6 +12349,32 @@ body::before {
   color: var(--text-4);
   font: 10px var(--font-mono);
 }
+.sidebar-right > .kota-version-label {
+  align-self: flex-end;
+  margin: 0 12px 12px;
+}
+.kota-version-label {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  flex: 0 0 auto;
+  white-space: nowrap;
+  cursor: default;
+}
+.kota-version-name {
+  color: var(--brass-hi);
+  font: 700 9.5px/1.2 var(--font-display);
+  letter-spacing: 1.1px;
+}
+.kota-version-separator {
+  color: var(--text-4);
+  font: 400 9px/1 var(--font-sans);
+}
+.kota-version-number {
+  color: var(--text-3);
+  font: 400 9px/1.2 var(--font-mono);
+  letter-spacing: 0;
+}
 .archive-launcher {
   width: 126px;
   min-height: 30px;
@@ -18869,6 +18897,57 @@ body::before {
 .violet-system-line-text strong {
   color: rgba(238, 221, 184, 0.88);
   font-weight: 760;
+}
+
+.violet-msg.system-line.sandbox-downgrade {
+  grid-template-columns: minmax(32px, 1fr) minmax(0, auto) minmax(32px, 1fr);
+}
+
+.sandbox-downgrade .violet-system-line-text {
+  min-width: 0;
+  max-width: 720px;
+  overflow: visible;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+}
+
+.violet-sandbox-notice-mark {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin: 0 7px 1px 0;
+  border-radius: 50%;
+  background: #D98A78;
+  box-shadow: 0 0 5px rgba(217, 138, 120, 0.7);
+  vertical-align: middle;
+}
+
+.violet-sandbox-refresh {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--brass-bright);
+  font: inherit;
+  font-weight: 700;
+  letter-spacing: inherit;
+  text-decoration: underline;
+  text-decoration-color: rgba(197, 187, 170, 0.45);
+  text-underline-offset: 3px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.violet-sandbox-refresh:hover,
+.violet-sandbox-refresh:focus-visible {
+  color: #EEDDB8;
+  text-decoration-color: rgba(238, 221, 184, 0.8);
+}
+
+.violet-sandbox-refresh:focus-visible {
+  outline: 1px solid var(--brass-bright);
+  outline-offset: 3px;
 }
 
 .violet-msg.user .violet-msg-body {
